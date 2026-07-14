@@ -1,0 +1,15 @@
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+wandb/
+swanlog/
+logs/
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors

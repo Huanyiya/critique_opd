@@ -1,0 +1,13 @@
+- name: alfworld_opd
+  _target_: verl.experimental.agent_loop.alfworld_agent_loop.ALFWorldAgentLoop
+  config_path: ${oc.env:ALFWORLD_CONFIG_PATH,null}
+  train_split: ${oc.env:ALFWORLD_TRAIN_SPLIT,train}
+  eval_split: ${oc.env:ALFWORLD_EVAL_SPLIT,eval_in_distribution}
+  seed: ${oc.decode:${oc.env:ALFWORLD_SEED,0}}
+  num_games: ${oc.decode:${oc.env:ALFWORLD_NUM_GAMES,null}}
+  max_steps: ${oc.decode:${oc.env:ALFWORLD_MAX_STEPS,30}}
+  history_length: ${oc.decode:${oc.env:ALFWORLD_HISTORY_LENGTH,5}}
+  max_action_tokens: ${oc.decode:${oc.env:ALFWORLD_MAX_ACTION_TOKENS,128}}
+  teacher_critique_max_tokens: ${oc.decode:${oc.env:ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS,256}}
+  teacher_prompt_builder:
+    _target_: verl.experimental.agent_loop.teacher_prompt.ALFWorldCritiqueTeacherPromptBuilder
