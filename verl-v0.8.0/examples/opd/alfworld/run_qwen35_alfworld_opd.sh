@@ -4,24 +4,25 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 
-: "${STUDENT_MODEL_PATH:?Set STUDENT_MODEL_PATH to a Qwen3.5 student checkpoint}"
-: "${TEACHER_MODEL_PATH:?Set TEACHER_MODEL_PATH to a Qwen3.5 teacher checkpoint}"
+STUDENT_MODEL_PATH=${STUDENT_MODEL_PATH:-/mnt/cpfs/weights/Qwen3.5-4B}
+TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/mnt/cpfs/weights/Qwen-7B}
 
 DATA_DIR=${DATA_DIR:-${HOME}/data/alfworld_opd}
+export ALFWORLD_DATA=${ALFWORLD_DATA:-/mnt/cpfs/datasets/alfworld}
 OUTPUT_DIR=${OUTPUT_DIR:-${ROOT_DIR}/checkpoints/alfworld_opd}
-TRAIN_TASKS=${TRAIN_TASKS:-8}
-VAL_TASKS=${VAL_TASKS:-8}
-TOTAL_EPOCHS=${TOTAL_EPOCHS:-20}
+TRAIN_TASKS=${TRAIN_TASKS:-32}
+VAL_TASKS=${VAL_TASKS:-128}
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-160}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 
 STUDENT_GPUS_PER_NODE=${STUDENT_GPUS_PER_NODE:-4}
 TEACHER_GPUS_PER_NODE=${TEACHER_GPUS_PER_NODE:-4}
 NNODES=${NNODES:-1}
 STUDENT_TP=${STUDENT_TP:-1}
 TEACHER_TP=${TEACHER_TP:-4}
-AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-8}
+AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-32}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.6}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.8}
 
@@ -29,13 +30,13 @@ LEARNING_RATE=${LEARNING_RATE:-1e-6}
 PROJECT_NAME=${PROJECT_NAME:-alfworld_opd}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen35_text_alfworld_opd}
 SAVE_FREQ=${SAVE_FREQ:-10}
-TEST_FREQ=${TEST_FREQ:-5}
+TEST_FREQ=${TEST_FREQ:-10}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}
 
 export ALFWORLD_MAX_STEPS=${ALFWORLD_MAX_STEPS:-30}
 export ALFWORLD_HISTORY_LENGTH=${ALFWORLD_HISTORY_LENGTH:-5}
-export ALFWORLD_MAX_ACTION_TOKENS=${ALFWORLD_MAX_ACTION_TOKENS:-128}
-export ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS=${ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS:-256}
+export ALFWORLD_MAX_ACTION_TOKENS=${ALFWORLD_MAX_ACTION_TOKENS:-${MAX_RESPONSE_LENGTH}}
+export ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS=${ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS:-512}
 export ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE=${ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE:-0.1}
 export ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH=${ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH:-"${OUTPUT_DIR}/teacher_critique_rejects.txt"}
 
@@ -90,8 +91,8 @@ python3 -m verl.trainer.main_ppo_sync \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="${TEACHER_GPU_MEMORY_UTILIZATION}" \
     distillation.teacher_models.teacher_model.inference.max_model_len="${MAX_MODEL_LEN}" \
     distillation.teacher_models.teacher_model.inference.max_num_batched_tokens="${MAX_MODEL_LEN}" \
-    distillation.distillation_loss.loss_mode=reverse_kl_full_vocab \
-    distillation.distillation_loss.topk=null \
+    distillation.distillation_loss.loss_mode=reverse_kl_topk \
+    distillation.distillation_loss.topk=16 \
     distillation.distillation_loss.log_prob_min_clamp=null \
     distillation.distillation_loss.loss_max_clamp=null \
     distillation.distillation_loss.use_policy_gradient=False \

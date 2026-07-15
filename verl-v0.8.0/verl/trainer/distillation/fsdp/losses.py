@@ -204,3 +204,86 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
     }
+
+
+def compute_reverse_kl_topk(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+    unprivileged_teacher_topk_log_probs: torch.Tensor | None = None,
+    unprivileged_teacher_topk_ids: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Compute reverse KL for privileged and unprivileged teacher top-k supports.
+
+    The privileged loss is returned as ``distillation_losses`` and drives the
+    update. When the unprivileged current-prompt teacher tensors are present, a
+    second reverse KL is returned under ``unprivileged_*`` keys for comparison.
+    Student and teacher are normalized separately on each teacher top-k support.
+    """
+    del data_format
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    loss_config: DistillationLossConfig = config.distillation_loss
+
+    def _compute_on_teacher_support(
+        topk_log_probs: torch.Tensor, topk_ids: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        if not topk_log_probs.is_nested or not topk_ids.is_nested:
+            raise ValueError("Top-k teacher log probabilities and token ids must be nested tensors.")
+        topk_log_probs = topk_log_probs.values().unsqueeze(0).float()
+        topk_ids = topk_ids.values().unsqueeze(0).to(dtype=torch.int64)
+        if get_ulysses_sequence_parallel_world_size() > 1:
+            topk_log_probs = slice_input_tensor(topk_log_probs, dim=1)
+            topk_ids = slice_input_tensor(topk_ids, dim=1)
+        if topk_log_probs.shape != topk_ids.shape or topk_log_probs.shape[:2] != student_logits.shape[:2]:
+            raise ValueError(
+                "Teacher top-k tensors must align with student sequence logits, got "
+                f"logprobs={topk_log_probs.shape}, ids={topk_ids.shape}, student={student_logits.shape}."
+            )
+
+        student_topk_ids = torch.topk(student_log_probs, k=topk_ids.shape[-1], dim=-1).indices
+        student_log_probs_on_teacher_topk = torch.gather(
+            student_log_probs, dim=-1, index=topk_ids
+        ).float()
+        student_mass = student_log_probs_on_teacher_topk.exp().sum(dim=-1)
+        teacher_mass = topk_log_probs.exp().sum(dim=-1)
+
+        if loss_config.log_prob_min_clamp is not None:
+            student_log_probs_on_teacher_topk = student_log_probs_on_teacher_topk.clamp_min(
+                loss_config.log_prob_min_clamp
+            )
+            topk_log_probs = topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+
+        student_log_probs_on_teacher_topk = student_log_probs_on_teacher_topk - torch.logsumexp(
+            student_log_probs_on_teacher_topk, dim=-1, keepdim=True
+        )
+        topk_log_probs = topk_log_probs - torch.logsumexp(topk_log_probs, dim=-1, keepdim=True)
+        student_probs_on_teacher_topk = student_log_probs_on_teacher_topk.exp()
+        token_reverse_kl = student_probs_on_teacher_topk * (
+            student_log_probs_on_teacher_topk - topk_log_probs
+        )
+        overlap_mask = (topk_ids.unsqueeze(-1) == student_topk_ids.unsqueeze(-2)).any(dim=-1)
+        overlap_count = overlap_mask.sum(dim=-1)
+        overlap_token_advantage_sum = (-token_reverse_kl * overlap_mask).sum(dim=-1)
+        overlap_token_advantage = overlap_token_advantage_sum / overlap_count.clamp_min(1)
+        overlap_token_advantage = torch.where(
+            overlap_count > 0, overlap_token_advantage, torch.zeros_like(overlap_token_advantage)
+        )
+        return {
+            "distillation_losses": token_reverse_kl.sum(dim=-1),
+            "student_mass": student_mass,
+            "teacher_mass": teacher_mass,
+            "overlap_count": overlap_count,
+            "overlap_token_advantage": overlap_token_advantage,
+        }
+
+    outputs = _compute_on_teacher_support(teacher_topk_log_probs, teacher_topk_ids)
+    if (unprivileged_teacher_topk_log_probs is None) != (unprivileged_teacher_topk_ids is None):
+        raise ValueError("Unprivileged teacher top-k log probabilities and ids must be provided together.")
+    if unprivileged_teacher_topk_log_probs is not None and unprivileged_teacher_topk_ids is not None:
+        unprivileged_outputs = _compute_on_teacher_support(
+            unprivileged_teacher_topk_log_probs, unprivileged_teacher_topk_ids
+        )
+        outputs.update({f"unprivileged_{key}": value.detach() for key, value in unprivileged_outputs.items()})
+    return outputs

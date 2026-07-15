@@ -111,10 +111,10 @@ class DistillationLossConfig(BaseConfig):
                 " wrt model weights does not depend on teacher log probabilities."
             )
 
-        if self.loss_mode == "reverse_kl_full_vocab":
+        if self.loss_mode in {"reverse_kl_full_vocab", "reverse_kl_topk"}:
             if self.use_policy_gradient:
                 raise ValueError(
-                    "reverse_kl_full_vocab selected-token OPD must be directly backpropagated with "
+                    f"{self.loss_mode} OPD must be directly backpropagated with "
                     "use_policy_gradient=False."
                 )
 

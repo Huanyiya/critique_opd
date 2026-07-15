@@ -109,6 +109,14 @@ class AgentLoopOutput(BaseModel):
     """Minimum teacher confidence required for a failed trajectory to participate in OPD."""
     teacher_critique_reject_log_path: Optional[str] = None
     """Text file used to record failed trajectories rejected by teacher critique parsing/confidence."""
+    opd_step_prompt_ids: Optional[list[list[int]]] = None
+    """Rollout-time current prompt ids for each environment step."""
+    opd_step_prompt_texts: Optional[list[str]] = None
+    """Rollout-time current prompt text for each environment step."""
+    opd_step_response_ids: Optional[list[list[int]]] = None
+    """Student-generated response ids for each environment step."""
+    opd_step_response_logprobs: Optional[list[list[float]]] = None
+    """Rollout log probabilities for each per-step student response, when available."""
     response_ids: list[int]
     """Response token ids including LLM generated token, tool response token."""
     response_mask: list[int]
@@ -146,6 +154,10 @@ class AgentLoopOutput(BaseModel):
             "teacher_critique_max_tokens",
             "teacher_critique_min_confidence",
             "teacher_critique_reject_log_path",
+            "opd_step_prompt_ids",
+            "opd_step_prompt_texts",
+            "opd_step_response_ids",
+            "opd_step_response_logprobs",
         ):
             output.pop(field, None)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
@@ -170,6 +182,10 @@ class AgentLoopOutput(BaseModel):
             output["extra_fields"].pop("teacher_ids", None),
             output["extra_fields"].pop("teacher_logprobs", None),
         )
+        unprivileged_teacher_ids, unprivileged_teacher_logprobs = (
+            output["extra_fields"].pop("unprivileged_teacher_ids", None),
+            output["extra_fields"].pop("unprivileged_teacher_logprobs", None),
+        )
         teacher_response_indices, teacher_full_logprobs = (
             output["extra_fields"].pop("teacher_response_indices", None),
             output["extra_fields"].pop("teacher_full_logprobs", None),
@@ -178,6 +194,10 @@ class AgentLoopOutput(BaseModel):
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
             output["teacher_logprobs"] = teacher_logprobs
+        if unprivileged_teacher_ids is not None:
+            output["unprivileged_teacher_ids"] = unprivileged_teacher_ids
+        if unprivileged_teacher_logprobs is not None:
+            output["unprivileged_teacher_logprobs"] = unprivileged_teacher_logprobs
         if teacher_response_indices is not None:
             output["teacher_response_indices"] = teacher_response_indices
         if teacher_full_logprobs is not None:
@@ -208,6 +228,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
+    unprivileged_teacher_logprobs: Optional[torch.Tensor] = None
+    """Padded top-k log probabilities from the teacher without critique feedback."""
+    unprivileged_teacher_ids: Optional[torch.Tensor] = None
+    """Padded token ids for the unprivileged teacher top-k distributions."""
     teacher_response_indices: Optional[torch.Tensor] = None
     """Response-local positions with full-vocabulary teacher distributions."""
     teacher_full_logprobs: Optional[torch.Tensor] = None
@@ -601,7 +625,13 @@ class AgentLoopWorker:
                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        outputs = await asyncio.gather(*tasks)
+        gathered_outputs = await asyncio.gather(*tasks)
+        outputs = []
+        for gathered_output in gathered_outputs:
+            if isinstance(gathered_output, list):
+                outputs.extend(gathered_output)
+            else:
+                outputs.append(gathered_output)
 
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
@@ -616,7 +646,7 @@ class AgentLoopWorker:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> _InternalAgentLoopOutput | list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -666,19 +696,151 @@ class AgentLoopWorker:
                 padded["attention_mask"] = padded["attention_mask"].unsqueeze(0)
         return padded
 
-    async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+    def _agent_loop_output_to_internal(self, output: AgentLoopOutput) -> _InternalAgentLoopOutput:
+        """Pad one already-scored ``AgentLoopOutput`` into the internal tensor format."""
+        prompt_output = self._pad_token_ids(
+            output.prompt_ids,
+            max_length=self.rollout_config.prompt_length,
+            padding_side="left",
+            return_attention_mask=True,
+        )
+
+        response_output = self._pad_token_ids(
+            output.response_ids,
+            max_length=self.rollout_config.response_length,
+            padding_side="right",
+            return_attention_mask=True,
+        )
+
+        response_mask_output = self._pad_token_ids(
+            output.response_mask,
+            max_length=self.rollout_config.response_length,
+            padding_side="right",
+            return_attention_mask=False,
+        )
+
+        response_logprobs = None
+        if output.response_logprobs is not None:
+            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+            response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+
+        response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
+        attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
+        input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
+
+        routed_experts = None
+        if output.routed_experts is not None:
+            total_length = input_ids.shape[1]
+            length, layer_num, topk_num = output.routed_experts.shape
+            if isinstance(output.routed_experts, np.ndarray):
+                routed_experts_array = output.routed_experts
+                if not routed_experts_array.flags.writeable:
+                    routed_experts_array = routed_experts_array.copy()
+                experts_tensor = torch.from_numpy(routed_experts_array)
+            elif isinstance(output.routed_experts, torch.Tensor):
+                experts_tensor = output.routed_experts
+            else:
+                raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
+            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
+            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+            end_pos = min(start_pos + length, total_length)
+            if start_pos < 0 or end_pos > total_length:
+                raise ValueError(
+                    f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
+                )
+            routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+
+        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        position_ids = self._compute_position_ids(
+            input_ids,
+            attention_mask,
+            multi_modal_inputs,
+            output.mm_processor_kwargs
+            if output.mm_processor_kwargs is not None
+            else self._get_mm_processor_kwargs(
+                output.multi_modal_data.get("audios") if output.multi_modal_data else None
+            ),
+        )
+        teacher_ids, teacher_logprobs = (
+            output.extra_fields.pop("teacher_ids", None),
+            output.extra_fields.pop("teacher_logprobs", None),
+        )
+        unprivileged_teacher_ids, unprivileged_teacher_logprobs = (
+            output.extra_fields.pop("unprivileged_teacher_ids", None),
+            output.extra_fields.pop("unprivileged_teacher_logprobs", None),
+        )
+        teacher_response_indices, teacher_full_logprobs = (
+            output.extra_fields.pop("teacher_response_indices", None),
+            output.extra_fields.pop("teacher_full_logprobs", None),
+        )
+        if teacher_ids is not None and teacher_logprobs is not None:
+            from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
+
+            teacher_ids, teacher_logprobs = _pad_teacher_outputs(
+                teacher_ids,
+                teacher_logprobs,
+                prompt_width=prompt_output["input_ids"].shape[1],
+                response_width=response_output["input_ids"].shape[1],
+                prompt_length=len(output.prompt_ids),
+                response_length=len(output.response_ids),
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        if unprivileged_teacher_ids is not None and unprivileged_teacher_logprobs is not None:
+            from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
+
+            unprivileged_teacher_ids, unprivileged_teacher_logprobs = _pad_teacher_outputs(
+                unprivileged_teacher_ids,
+                unprivileged_teacher_logprobs,
+                prompt_width=prompt_output["input_ids"].shape[1],
+                response_width=response_output["input_ids"].shape[1],
+                prompt_length=len(output.prompt_ids),
+                response_length=len(output.response_ids),
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+
+        return _InternalAgentLoopOutput(
+            prompt_ids=prompt_output["input_ids"],
+            response_ids=response_output["input_ids"],
+            input_ids=input_ids,
+            position_ids=position_ids,
+            response_mask=response_mask,
+            attention_mask=attention_mask,
+            response_logprobs=response_logprobs,
+            routed_experts=routed_experts,
+            multi_modal_inputs=multi_modal_inputs,
+            multi_modal_data=output.multi_modal_data,
+            mm_processor_kwargs=output.mm_processor_kwargs,
+            teacher_logprobs=teacher_logprobs,
+            teacher_ids=teacher_ids,
+            unprivileged_teacher_logprobs=unprivileged_teacher_logprobs,
+            unprivileged_teacher_ids=unprivileged_teacher_ids,
+            teacher_response_indices=teacher_response_indices,
+            teacher_full_logprobs=teacher_full_logprobs,
+            reward_score=output.reward_score,
+            num_turns=output.num_turns,
+            metrics=output.metrics,
+            extra_fields=output.extra_fields,
+        )
+
+    async def _agent_loop_postprocess(
+        self, output, validate, **kwargs
+    ) -> _InternalAgentLoopOutput | list[_InternalAgentLoopOutput]:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        for key, value in kwargs.items():
+            output.extra_fields.setdefault(key, value)
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
         await self._compute_score([output], kwargs=kwargs)
-        await self._compute_teacher_logprobs(
+        expanded_outputs = await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
             response_ids=output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
         )
+        if expanded_outputs is not None:
+            return [self._agent_loop_output_to_internal(expanded_output) for expanded_output in expanded_outputs]
 
         # NOTE: consistent with the legacy batch version of generate_sequences that existed in the
         # deprecated vLLM SPMD rollout implementation.
@@ -771,6 +933,10 @@ class AgentLoopWorker:
             output.extra_fields.pop("teacher_ids", None),
             output.extra_fields.pop("teacher_logprobs", None),
         )
+        unprivileged_teacher_ids, unprivileged_teacher_logprobs = (
+            output.extra_fields.pop("unprivileged_teacher_ids", None),
+            output.extra_fields.pop("unprivileged_teacher_logprobs", None),
+        )
         teacher_response_indices, teacher_full_logprobs = (
             output.extra_fields.pop("teacher_response_indices", None),
             output.extra_fields.pop("teacher_full_logprobs", None),
@@ -782,6 +948,18 @@ class AgentLoopWorker:
             teacher_ids, teacher_logprobs = _pad_teacher_outputs(
                 teacher_ids,
                 teacher_logprobs,
+                prompt_width=prompt_output["input_ids"].shape[1],
+                response_width=response_output["input_ids"].shape[1],
+                prompt_length=len(output.prompt_ids),
+                response_length=len(output.response_ids),
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        if unprivileged_teacher_ids is not None and unprivileged_teacher_logprobs is not None:
+            from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
+
+            unprivileged_teacher_ids, unprivileged_teacher_logprobs = _pad_teacher_outputs(
+                unprivileged_teacher_ids,
+                unprivileged_teacher_logprobs,
                 prompt_width=prompt_output["input_ids"].shape[1],
                 response_width=response_output["input_ids"].shape[1],
                 prompt_length=len(output.prompt_ids),
@@ -803,6 +981,8 @@ class AgentLoopWorker:
             mm_processor_kwargs=output.mm_processor_kwargs,
             teacher_logprobs=teacher_logprobs,
             teacher_ids=teacher_ids,
+            unprivileged_teacher_logprobs=unprivileged_teacher_logprobs,
+            unprivileged_teacher_ids=unprivileged_teacher_ids,
             teacher_response_indices=teacher_response_indices,
             teacher_full_logprobs=teacher_full_logprobs,
             reward_score=output.reward_score,
@@ -968,6 +1148,8 @@ class AgentLoopWorker:
         )
         output.extra_fields["teacher_ids"] = teacher_ids
         output.extra_fields["teacher_logprobs"] = teacher_logprobs
+        output.extra_fields["unprivileged_teacher_ids"] = teacher_ids.clone()
+        output.extra_fields["unprivileged_teacher_logprobs"] = teacher_logprobs.clone()
 
     def _exclude_from_opd_training(self, output: AgentLoopOutput, prompt_ids: list[int], reason: str) -> None:
         """Keep the rollout for logging/eval but remove all OPD training tokens."""
@@ -1055,6 +1237,115 @@ class AgentLoopWorker:
         except OSError as exc:
             logger.warning("Failed to write teacher critique reject log to %s: %s", log_path, exc)
 
+    async def _expand_current_prompt_opd_outputs(
+        self,
+        output: AgentLoopOutput,
+        *,
+        feedback: Any,
+        error_step: int,
+        original_response_length: int,
+        sample_kwargs: Optional[dict[str, Any]],
+    ) -> list[AgentLoopOutput]:
+        """Build step-level OPD samples whose student prompt matches rollout-time current prompts."""
+        if output.teacher_prompt_template is None:
+            raise ValueError("Current-prompt OPD expansion requires teacher_prompt_template.")
+        if output.opd_step_prompt_ids is None or output.opd_step_response_ids is None:
+            raise ValueError("Current-prompt OPD expansion requires per-step prompt and response ids.")
+
+        step_prompt_ids = output.opd_step_prompt_ids
+        step_prompt_texts = output.opd_step_prompt_texts or [""] * len(step_prompt_ids)
+        step_response_ids = output.opd_step_response_ids
+        step_response_logprobs = output.opd_step_response_logprobs
+        if not (len(step_prompt_ids) == len(step_prompt_texts) == len(step_response_ids)):
+            raise ValueError(
+                "Per-step prompt ids, prompt texts, and response ids must have identical lengths, got "
+                f"{len(step_prompt_ids)=}, {len(step_prompt_texts)=}, {len(step_response_ids)=}."
+            )
+        if step_response_logprobs is not None and len(step_response_logprobs) != len(step_response_ids):
+            raise ValueError(
+                "Per-step response logprobs must match per-step responses, got "
+                f"{len(step_response_logprobs)=}, {len(step_response_ids)=}."
+            )
+        if not 0 <= error_step < len(step_response_ids):
+            raise ValueError(f"error_step={error_step} is outside the collected step range.")
+
+        expanded_outputs: list[AgentLoopOutput] = []
+        apply_chat_template_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}) or {})
+        from verl.experimental.agent_loop.teacher_prompt import insert_teacher_feedback_into_current_prompt
+
+        teacher_feedback_prompt = output.teacher_prompt_template.format(
+            error_step=error_step + 1,
+            reason=feedback.reason,
+            better_decision=feedback.better_decision,
+            confidence=f"{feedback.confidence:.3f}",
+            current_prompt="",
+        )
+        for step_index in range(error_step + 1):
+            current_response_ids = list(step_response_ids[step_index])
+            if not current_response_ids:
+                continue
+
+            child = output.model_copy(deep=True)
+            child.prompt_ids = list(step_prompt_ids[step_index])
+            child.response_ids = current_response_ids
+            child.response_mask = [1] * len(current_response_ids)
+            child.response_logprobs = (
+                list(step_response_logprobs[step_index]) if step_response_logprobs is not None else None
+            )
+            child.teacher_critique_prompt_ids = None
+            child.teacher_prompt_template = None
+            child.response_step_end_indices = None
+            child.opd_step_prompt_ids = None
+            child.opd_step_prompt_texts = None
+            child.opd_step_response_ids = None
+            child.opd_step_response_logprobs = None
+            child.num_turns = 1
+
+            for field_name in (
+                "teacher_ids",
+                "teacher_logprobs",
+                "unprivileged_teacher_ids",
+                "unprivileged_teacher_logprobs",
+                "teacher_response_indices",
+                "teacher_full_logprobs",
+            ):
+                child.extra_fields.pop(field_name, None)
+            child.extra_fields.update(
+                {
+                    "opd_selected": True,
+                    "opd_error_step": error_step,
+                    "opd_step_index": step_index,
+                    "opd_response_cutoff": sum(len(step_response_ids[i]) for i in range(error_step + 1)),
+                    "opd_original_response_length": original_response_length,
+                    "student_prompt_matches_rollout": True,
+                }
+            )
+
+            scoring_prompt = insert_teacher_feedback_into_current_prompt(
+                current_prompt=step_prompt_texts[step_index],
+                teacher_feedback=teacher_feedback_prompt,
+            )
+            tokenized_teacher_prompt = apply_chat_template(
+                self.tokenizer,
+                [{"role": "user", "content": scoring_prompt}],
+                add_generation_prompt=True,
+                tokenize=True,
+                **apply_chat_template_kwargs,
+            )
+            child.teacher_prompt_ids = normalize_token_ids(tokenized_teacher_prompt)
+            await self._compute_teacher_logprobs(
+                child,
+                prompt_ids=child.prompt_ids,
+                response_ids=child.response_ids,
+                validate=False,
+                sample_kwargs=sample_kwargs,
+            )
+            expanded_outputs.append(child)
+
+        if not expanded_outputs:
+            raise ValueError("Current-prompt OPD expansion produced no trainable step outputs.")
+        return expanded_outputs
+
     async def _compute_teacher_logprobs(
         self,
         output: AgentLoopOutput,
@@ -1062,10 +1353,10 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
-    ) -> None:
+    ) -> Optional[list[AgentLoopOutput]]:
         """Generate privileged critique when requested, then compute teacher logprobs."""
         if not self.distillation_enabled or validate:
-            return
+            return None
 
         routing_key = None
         if sample_kwargs is not None:
@@ -1079,7 +1370,7 @@ class AgentLoopWorker:
                 # Successful trajectories remain available for reward metrics but contribute
                 # no OPD tokens and do not consume either teacher generation or scoring.
                 self._exclude_from_opd_training(output, prompt_ids, "not_opd_eligible")
-                return
+                return None
 
             if output.teacher_prompt_template is None or output.response_step_end_indices is None:
                 raise ValueError(
@@ -1128,7 +1419,7 @@ class AgentLoopWorker:
                     feedback=feedback,
                 )
                 self._exclude_from_opd_training(output, prompt_ids, "teacher_critique_parse_failed")
-                return
+                return None
             if feedback.confidence < output.teacher_critique_min_confidence:
                 self._log_teacher_critique_reject(
                     output,
@@ -1137,9 +1428,23 @@ class AgentLoopWorker:
                     feedback=feedback,
                 )
                 self._exclude_from_opd_training(output, prompt_ids, "teacher_critique_low_confidence")
-                return
+                return None
 
             error_step = feedback.error_step
+            if output.opd_step_prompt_ids is not None or output.opd_step_response_ids is not None:
+                original_response_length = (
+                    sum(len(step_response_ids) for step_response_ids in output.opd_step_response_ids)
+                    if output.opd_step_response_ids is not None
+                    else len(output.response_ids)
+                )
+                return await self._expand_current_prompt_opd_outputs(
+                    output,
+                    feedback=feedback,
+                    error_step=error_step,
+                    original_response_length=original_response_length,
+                    sample_kwargs=sample_kwargs,
+                )
+
             response_cutoff = output.response_step_end_indices[error_step]
             if response_cutoff <= 0 or response_cutoff > len(output.response_ids):
                 raise ValueError(
@@ -1153,12 +1458,14 @@ class AgentLoopWorker:
                 output.response_logprobs = output.response_logprobs[:response_cutoff]
             response_ids = output.response_ids
 
-            scoring_prompt = output.teacher_prompt_template.format(
+            teacher_feedback_prompt = output.teacher_prompt_template.format(
                 error_step=error_step + 1,
                 reason=feedback.reason,
                 better_decision=feedback.better_decision,
                 confidence=f"{feedback.confidence:.3f}",
+                current_prompt="",
             )
+            scoring_prompt = teacher_feedback_prompt
             apply_chat_template_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}) or {})
             tokenized_teacher_prompt = apply_chat_template(
                 self.tokenizer,
@@ -1191,7 +1498,7 @@ class AgentLoopWorker:
             )
             output.extra_fields["teacher_response_indices"] = teacher_response_indices
             output.extra_fields["teacher_full_logprobs"] = teacher_full_logprobs
-            return
+            return None
 
         teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
             sequence_ids=teacher_prompt_ids + response_ids,
@@ -1211,6 +1518,28 @@ class AgentLoopWorker:
         )
         output.extra_fields["teacher_ids"] = teacher_ids
         output.extra_fields["teacher_logprobs"] = teacher_logprobs
+
+        if output.extra_fields.get("opd_selected", False):
+            unprivileged_teacher_ids, unprivileged_teacher_logprobs = (
+                await self.teacher_server_manager.compute_teacher_logprobs_single(
+                    sequence_ids=prompt_ids + response_ids,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    routing_key=routing_key,
+                )
+            )
+            unprivileged_teacher_ids, unprivileged_teacher_logprobs = align_teacher_outputs_to_student_response(
+                unprivileged_teacher_ids,
+                unprivileged_teacher_logprobs,
+                teacher_prompt_length=len(prompt_ids),
+                student_prompt_length=len(prompt_ids),
+                response_length=len(response_ids),
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+            output.extra_fields["unprivileged_teacher_ids"] = unprivileged_teacher_ids
+            output.extra_fields["unprivileged_teacher_logprobs"] = unprivileged_teacher_logprobs
+            output.extra_fields["unprivileged_teacher_prompt_matches_student"] = True
+        return None
 
     def _postprocess(
         self,
@@ -1234,6 +1563,16 @@ class AgentLoopWorker:
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if (
+            inputs[0].unprivileged_teacher_logprobs is not None
+            and inputs[0].unprivileged_teacher_ids is not None
+        ):
+            optional_outputs["unprivileged_teacher_logprobs"] = torch.cat(
+                [input.unprivileged_teacher_logprobs for input in inputs], dim=0
+            )
+            optional_outputs["unprivileged_teacher_ids"] = torch.cat(
+                [input.unprivileged_teacher_ids for input in inputs], dim=0
+            )
         if inputs[0].teacher_full_logprobs is not None and inputs[0].teacher_response_indices is not None:
             optional_outputs["teacher_full_logprobs"] = torch.nested.as_nested_tensor(
                 [input.teacher_full_logprobs for input in inputs], layout=torch.jagged
@@ -1267,7 +1606,15 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(input_non_tensor_batch)
+            compatible_non_tensor_batch = {}
+            for key, value in input_non_tensor_batch.items():
+                try:
+                    has_matching_length = len(value) == len(inputs)
+                except TypeError:
+                    has_matching_length = False
+                if has_matching_length:
+                    compatible_non_tensor_batch[key] = value
+            non_tensor_batch.update(compatible_non_tensor_batch)
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]

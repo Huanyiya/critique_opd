@@ -28,6 +28,10 @@ CONFIDENCE_PATTERN = re.compile(
     r"<confidence>\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*</confidence>",
     flags=re.IGNORECASE,
 )
+TURN_ANCHORS = (
+    "Now it's your turn to",
+    "Now it's your turn",
+)
 
 
 @dataclass(frozen=True)
@@ -123,6 +127,30 @@ def parse_critique_error_step(critique: str, *, num_steps: int, fallback_step: i
     ).error_step
 
 
+def insert_teacher_feedback_into_current_prompt(*, current_prompt: str, teacher_feedback: str) -> str:
+    """Insert teacher-only feedback into the same current-step prompt shape used for rollout."""
+    prompt_text = str(current_prompt).strip()
+    feedback_text = str(teacher_feedback).strip()
+    if not feedback_text:
+        return prompt_text
+    if not prompt_text:
+        return feedback_text
+
+    for anchor in TURN_ANCHORS:
+        anchor_index = prompt_text.find(anchor)
+        if anchor_index < 0:
+            continue
+        prefix = prompt_text[:anchor_index].rstrip()
+        suffix = prompt_text[anchor_index:].lstrip()
+        if prefix and suffix:
+            return f"{prefix}\n\n{feedback_text}\n\n{suffix}"
+        if prefix:
+            return f"{prefix}\n\n{feedback_text}"
+        return f"{feedback_text}\n\n{suffix}"
+
+    return f"{prompt_text}\n\n{feedback_text}"
+
+
 class TeacherPromptBuilder(ABC):
     """Build the two teacher prompts used by critique-conditioned OPD.
 
@@ -140,7 +168,7 @@ class TeacherPromptBuilder(ABC):
 
     @abstractmethod
     def build_scoring_prompt_template(self, **context: Any) -> str:
-        """Return a template with ``error_step``, ``reason``, ``better_decision``, and ``confidence`` fields."""
+        """Return a template with feedback fields and an optional ``current_prompt`` field."""
 
 
 def format_alfworld_trajectory(trajectory_steps: list[dict[str, Any]]) -> str:
@@ -214,19 +242,13 @@ class ALFWorldCritiqueTeacherPromptBuilder(TeacherPromptBuilder):
         initial_admissible_actions: list[str],
         **context: Any,
     ) -> str:
-        del context
+        del task_description, initial_observation, initial_admissible_actions, context
         return (
-            "Task:\n"
-            f"{task_description}\n\n"
             "Private hindsight feedback from a failed attempt:\n\n"
             "Earliest critical error: step {error_step}.\n"
             "Reason: {reason}\n"
-            "Better decision: {better_decision}\n"
+            "Suggested action: {better_decision}\n"
             "Confidence: {confidence}\n\n"
             "Use this feedback silently when choosing actions.\n"
-            "Do not mention the feedback.\n\n"
-            "Initial observation:\n"
-            f"{initial_observation}\n\n"
-            "Initial admissible actions:\n"
-            f"{format_admissible_actions(initial_admissible_actions)}\n\n"
+            "Do not mention the feedback."
         )

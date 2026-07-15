@@ -92,7 +92,6 @@ class ALFWorldEnvironment(Protocol):
 
 def parse_alfworld_action(model_text: str, admissible_actions: list[str]) -> ParsedAction:
     """Parse OPID-style ``<think>``/``<action>`` output."""
-    del admissible_actions
     original_text = model_text
     lowered = model_text.lower()
     match = ACTION_PATTERN.search(lowered)
@@ -100,11 +99,13 @@ def parse_alfworld_action(model_text: str, admissible_actions: list[str]) -> Par
     has_no_chinese = CHINESE_PATTERN.search(original_text) is None
     format_valid = match is not None and has_thinking_block and has_no_chinese
     action = match.group(1).strip().lower() if match is not None else lowered[-30:]
+    is_admissible = action in {candidate.strip().lower() for candidate in admissible_actions}
+    is_valid = format_valid and is_admissible
     return ParsedAction(
         action=action,
-        is_valid=format_valid,
+        is_valid=is_valid,
         format_valid=format_valid,
-        admissible=format_valid,
+        admissible=is_admissible,
     )
 
 
@@ -312,7 +313,10 @@ class ALFWorldAgentLoop(AgentLoopBase):
             and str(teacher_critique_reject_log_path).lower() not in {"", "none", "null"}
             else None
         )
-        self.response_length = self.rollout_config.response_length
+        # In this OPID-style loop, rollout.response_length is the per-step
+        # student action width. The full trajectory is kept in metadata and
+        # per-step arrays; it is not packed into one long response tensor.
+        self.response_length = int(self.rollout_config.response_length)
         self.teacher_prompt_builder = teacher_prompt_builder or ALFWorldCritiqueTeacherPromptBuilder()
         self.environment_factory = environment_factory or InstalledALFWorldEnvironmentFactory(
             config_path=config_path,
@@ -364,10 +368,15 @@ class ALFWorldAgentLoop(AgentLoopBase):
 
         generate_seconds = 0.0
         num_preempted = 0
-        response_ids: list[int] = []
-        response_mask: list[int] = []
-        response_logprobs: list[float] = []
+        summary_response_ids: list[int] = []
+        summary_response_mask: list[int] = []
+        summary_response_logprobs: list[float] = []
         response_step_end_indices: list[int] = []
+        opd_step_prompt_ids: list[list[int]] = []
+        opd_step_prompt_texts: list[str] = []
+        opd_step_response_ids: list[list[int]] = []
+        opd_step_response_logprobs: list[list[float]] = []
+        total_action_tokens = 0
         logprobs_available = True
         history: list[dict[str, Any]] = []
         turn_rewards: list[float] = []
@@ -397,16 +406,13 @@ class ALFWorldAgentLoop(AgentLoopBase):
             )
             student_prompt_ids = await self.apply_chat_template([{"role": "user", "content": initial_prompt}])
             current_prompt_ids = student_prompt_ids
+            current_prompt_text = initial_prompt
             current_observation = initial_observation
 
             for step_index in range(self.max_steps):
-                remaining_tokens = self.response_length - len(response_ids)
-                if remaining_tokens <= 0:
-                    termination_reason = "response_length"
-                    break
-
                 turn_sampling_params = dict(sampling_params)
-                turn_sampling_params["max_tokens"] = min(self.max_action_tokens, remaining_tokens)
+                turn_max_tokens = min(self.max_action_tokens, self.response_length)
+                turn_sampling_params["max_tokens"] = turn_max_tokens
                 started = time.perf_counter()
                 output: TokenOutput = await self.server_manager.generate(
                     request_id=uuid4().hex,
@@ -420,17 +426,26 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 elif output.extra_fields.get("max_global_steps") is not None:
                     server_extra_fields["max_global_steps"] = output.extra_fields["max_global_steps"]
 
-                generated_ids = list(output.token_ids[:remaining_tokens])
+                generated_ids = list(output.token_ids[:turn_max_tokens])
                 if not generated_ids:
                     termination_reason = "empty_generation"
                     break
-                response_ids.extend(generated_ids)
-                response_mask.extend([1] * len(generated_ids))
-                response_step_end_indices.append(len(response_ids))
+                opd_step_prompt_ids.append(list(current_prompt_ids))
+                opd_step_prompt_texts.append(current_prompt_text)
+                opd_step_response_ids.append(list(generated_ids))
+                total_action_tokens += len(generated_ids)
+                response_step_end_indices.append(total_action_tokens)
+                current_logprobs = None
                 if output.log_probs is None:
                     logprobs_available = False
                 elif logprobs_available:
-                    response_logprobs.extend(output.log_probs[: len(generated_ids)])
+                    current_logprobs = list(output.log_probs[: len(generated_ids)])
+                    opd_step_response_logprobs.append(current_logprobs)
+                if not summary_response_ids:
+                    summary_response_ids = list(generated_ids)
+                    summary_response_mask = [1] * len(generated_ids)
+                    if current_logprobs is not None:
+                        summary_response_logprobs = list(current_logprobs)
 
                 model_text = await self.loop.run_in_executor(
                     None, lambda ids=generated_ids: self.tokenizer.decode(ids, skip_special_tokens=True)
@@ -462,9 +477,6 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 if transition.done:
                     termination_reason = "success" if bool(transition.info.get("won", False)) else "failure"
                     break
-                if len(response_ids) >= self.response_length:
-                    termination_reason = "response_length"
-                    break
 
                 current_observation = transition.observation
                 observation_prompt = build_alfworld_prompt(
@@ -476,19 +488,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
                     history_length=self.history_length,
                 )
                 current_prompt_ids = await self.apply_chat_template([{"role": "user", "content": observation_prompt}])
-                observation_ids = await self.apply_chat_template(
-                    [{"role": "user", "content": observation_prompt}],
-                    remove_system_prompt=True,
-                )
-                observation_ids = observation_ids[: self.response_length - len(response_ids)]
-                response_ids.extend(observation_ids)
-                response_mask.extend([0] * len(observation_ids))
-                if logprobs_available:
-                    response_logprobs.extend([0.0] * len(observation_ids))
-
-                if len(response_ids) >= self.response_length:
-                    termination_reason = "response_length"
-                    break
+                current_prompt_text = observation_prompt
             else:
                 termination_reason = "max_steps"
 
@@ -531,6 +531,14 @@ class ALFWorldAgentLoop(AgentLoopBase):
             compute_score=0.0,
             num_preempted=num_preempted,
         )
+        if not summary_response_ids:
+            fallback_token_id = self.tokenizer.eos_token_id
+            if fallback_token_id is None:
+                fallback_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            summary_response_ids = [int(fallback_token_id)]
+            summary_response_mask = [0]
+            if logprobs_available:
+                summary_response_logprobs = [0.0]
         extra_fields = {
             **server_extra_fields,
             "turn_scores": turn_rewards,
@@ -554,9 +562,17 @@ class ALFWorldAgentLoop(AgentLoopBase):
             teacher_critique_max_tokens=self.teacher_critique_max_tokens,
             teacher_critique_min_confidence=self.teacher_critique_min_confidence,
             teacher_critique_reject_log_path=self.teacher_critique_reject_log_path,
-            response_ids=response_ids,
-            response_mask=response_mask,
-            response_logprobs=response_logprobs if logprobs_available else None,
+            opd_step_prompt_ids=opd_step_prompt_ids,
+            opd_step_prompt_texts=opd_step_prompt_texts,
+            opd_step_response_ids=opd_step_response_ids,
+            opd_step_response_logprobs=opd_step_response_logprobs
+            if logprobs_available and len(opd_step_response_logprobs) == len(opd_step_response_ids)
+            else None,
+            response_ids=summary_response_ids,
+            response_mask=summary_response_mask,
+            response_logprobs=summary_response_logprobs
+            if logprobs_available and len(summary_response_logprobs) == len(summary_response_ids)
+            else None,
             reward_score=environment_reward,
             num_turns=1 + 2 * len(history),
             metrics=metrics,

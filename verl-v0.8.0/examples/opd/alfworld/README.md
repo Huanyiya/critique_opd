@@ -1,37 +1,41 @@
 # Text-only ALFWorld critique-conditioned OPD
 
 This example uses veRL's native agent-loop rollout, teacher inference workers,
-prompt-logprob computation, and exact full-vocabulary reverse-KL distillation. The student alone
+prompt-logprob computation, and top-k reverse-KL distillation. The student alone
 generates each ALFWorld trajectory. Successful trajectories are retained for
 environment-reward metrics but receive a zero training mask. For a failed
 trajectory, the same teacher worker performs two operations:
 
 1. Generate privileged critique `c` from the task and the complete failed
    trajectory. The structured critique identifies the earliest erroneous step.
-2. Score the original student response token IDs under a prompt containing the
-   task and `c`. The response is never decoded and re-tokenized for scoring.
+2. Score each original student action twice: once under that step's current
+   prompt augmented with `c`, and once under the exact original student current
+   prompt without `c`. The response is never decoded and re-tokenized.
 
-The `reverse_kl_full_vocab` loss compares the complete student and teacher
-distributions at the same response-token positions:
-`KL(p_student || p_teacher)`. This is not the native sampled-token `kl` estimator
-and it does not truncate either distribution to top-k tokens.
+The `reverse_kl_topk` loss uses the teacher's top 16 token IDs at each response
+position. It gathers the student's probabilities at those same IDs and computes
+`sum p_student * (log p_student - log p_teacher)` after separately normalizing
+the student and teacher distributions on that support. This is a distributional
+top-k loss, not the sampled-token `kl` estimator.
+The privileged reverse KL drives the student update. The unprivileged reverse
+KL is computed in the same forward pass as a control and is logged as
+`distillation/unprivileged_reverse_kl`; it is not added to the training loss.
 
-The response is truncated at the end of the teacher-identified erroneous action.
-Only student-generated action tokens from the start through that step have
-`response_mask=1`; later actions are not included in OPD.
+The rollout follows OPID's step-level packing: `data.max_response_length` is the
+maximum length of one student action response, not a full-trajectory token
+budget. Environment observations and admissible actions are used to build the
+next step's current prompt and are recorded in metadata; they are not appended
+to `responses`. After teacher critique, the failed trajectory is expanded into
+one training sample per student step from the beginning through the
+teacher-identified erroneous action. Later actions are not included in OPD.
 If a training batch contains no failed-trajectory tokens, the actor optimizer
 step is skipped entirely.
 
-To control memory, full-vocabulary teacher rows are retained only for
-student-generated tokens with `response_mask=1`. Teacher-prompt tokens,
-environment-observation tokens, successful trajectories, and tokens after the
-identified error cutoff do not carry a vocabulary-sized tensor. The teacher
-server requests one vLLM `logprobs=-1` next-token row for each selected response
-position; the generated dummy token is discarded and never enters the
-trajectory. This avoids materializing full-vocabulary rows for the teacher
-prompt or environment observations. The teacher engine is configured with
-`max_logprobs=-1` automatically. The actor path currently requires FSDP eager
-logits, fused kernels disabled, and Ulysses sequence parallel size 1.
+The teacher server requests `prompt_logprobs=16`; the generated dummy token is
+discarded and never enters the trajectory. Successful trajectories and tokens
+after the identified error cutoff remain excluded by `response_mask`. The
+launcher uses eager FSDP logits because the fused top-k kernel implements the
+native forward-KL path rather than this reverse-KL loss.
 
 ## Setup
 
@@ -76,6 +80,10 @@ evaluation metrics.
 By default, the actor/student pool uses four GPUs and the separate teacher pool
 uses four GPUs. Override `STUDENT_GPUS_PER_NODE`, `TEACHER_GPUS_PER_NODE`,
 `STUDENT_TP`, and `TEACHER_TP` to match the node and model sizes.
+
+`MAX_RESPONSE_LENGTH` controls the per-step action width. The launcher defaults
+`ALFWORLD_MAX_ACTION_TOKENS` to the same value, while `ALFWORLD_MAX_STEPS`
+controls the maximum number of environment steps in a trajectory.
 
 ## Two-task smoke test
 

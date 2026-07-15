@@ -159,8 +159,27 @@ def compute_topk_loss(
         case "fsdp" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk":
+                outputs = fsdp_losses.compute_reverse_kl_topk(
+                    student_logits=student_logits,
+                    teacher_topk_log_probs=data["teacher_logprobs"],
+                    teacher_topk_ids=data["teacher_ids"],
+                    unprivileged_teacher_topk_log_probs=data.get("unprivileged_teacher_logprobs"),
+                    unprivileged_teacher_topk_ids=data.get("unprivileged_teacher_ids"),
+                    config=distillation_config,
+                    data_format=data_format,
+                )
+                expected_shape = student_logits.shape[:2]
+                for key, value in outputs.items():
+                    assert value.shape == expected_shape, (
+                        f"Expected shape {expected_shape}, but got {value.shape} for {key=}."
+                    )
+                return outputs
+            else:
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
+            if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk":
+                raise NotImplementedError("reverse_kl_topk currently requires the FSDP or VeOmni actor strategy.")
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
@@ -325,14 +344,16 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk", "reverse_kl_topk"], use_topk=True)
+)  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
     model_output: dict,
     data: TensorDict,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Compute forward KL distillation loss and related metrics using top-k log probabilities.
+    """Return top-k distributional loss and metrics computed by the logits processor.
 
     Returns:
     - distillation_losses: (bsz, resp_len)
@@ -384,8 +405,28 @@ def compute_forward_kl_topk(
         **overlap_metrics,
     }
 
-    # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
+    # This guards normalized reverse KL against tiny negative roundoff and
+    # preserves the native forward-top-k handling of negative partial sums.
     distillation_losses = distillation_losses.clamp_min(0.0)
+
+    unprivileged_losses = model_output.get("unprivileged_distillation_losses")
+    if unprivileged_losses is not None:
+        unprivileged_losses = no_padding_2_padding(unprivileged_losses, data).clamp_min(0.0)
+        unprivileged_teacher_mass = no_padding_2_padding(model_output["unprivileged_teacher_mass"], data)
+        assert unprivileged_losses.shape == unprivileged_teacher_mass.shape == response_mask_bool.shape
+        privileged_valid = distillation_losses[response_mask_bool]
+        unprivileged_valid = unprivileged_losses[response_mask_bool]
+        unprivileged_teacher_mass_valid = unprivileged_teacher_mass[response_mask_bool]
+        distillation_metrics.update(
+            {
+                "distillation/privileged_reverse_kl": privileged_valid.mean().item(),
+                "distillation/unprivileged_reverse_kl": unprivileged_valid.mean().item(),
+                "distillation/privileged_minus_unprivileged_reverse_kl": (
+                    privileged_valid - unprivileged_valid
+                ).mean().item(),
+                "distillation/unprivileged_teacher_mass": unprivileged_teacher_mass_valid.mean().item(),
+            }
+        )
 
     return distillation_losses, distillation_metrics
 
