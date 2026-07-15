@@ -39,6 +39,25 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 ACTION_PATTERN = re.compile(r"<action>\s*(.*?)\s*</action>", flags=re.IGNORECASE | re.DOTALL)
 CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 TASK_MARKER = "Your task is to: "
+ALFWORLD_TEMPLATE_NO_HIS = """
+You are an expert agent operating in the ALFRED Embodied Environment.
+Your current observation is: {current_observation}
+Your admissible actions of the current situation are: [{admissible_actions}].
+
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+"""
+ALFWORLD_TEMPLATE = """
+You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
+Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
+You are now at step {current_step} and your current observation is: {current_observation}
+Your admissible actions of the current situation are: [{admissible_actions}].
+
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+"""
 
 
 @dataclass(frozen=True)
@@ -72,25 +91,20 @@ class ALFWorldEnvironment(Protocol):
 
 
 def parse_alfworld_action(model_text: str, admissible_actions: list[str]) -> ParsedAction:
-    """Parse OPID-style ``<action>`` output without requiring a thinking block."""
+    """Parse OPID-style ``<think>``/``<action>`` output."""
+    del admissible_actions
+    original_text = model_text
     lowered = model_text.lower()
     match = ACTION_PATTERN.search(lowered)
-    format_valid = match is not None and CHINESE_PATTERN.search(model_text) is None
-    # OPID forwards a short suffix for malformed output instead of replacing it
-    # with an oracle action. Preserve that behavior and let ALFWorld respond.
-    action = match.group(1).strip() if match is not None else lowered[-30:].strip()
-
-    admissible_lookup = {
-        candidate.lower().strip(): candidate for candidate in admissible_actions if candidate != "help"
-    }
-    is_admissible = action in admissible_lookup
-    if is_admissible:
-        action = admissible_lookup[action]
+    has_thinking_block = "<think>" in original_text and "</think>" in original_text
+    has_no_chinese = CHINESE_PATTERN.search(original_text) is None
+    format_valid = match is not None and has_thinking_block and has_no_chinese
+    action = match.group(1).strip().lower() if match is not None else lowered[-30:]
     return ParsedAction(
         action=action,
-        is_valid=format_valid and is_admissible,
+        is_valid=format_valid,
         format_valid=format_valid,
-        admissible=is_admissible,
+        admissible=format_valid,
     )
 
 
@@ -111,29 +125,32 @@ def build_alfworld_prompt(
     step_index: int,
     history_length: int,
 ) -> str:
-    """Build one action prompt from task, current observation, and recent history."""
-    recent_history = history[-history_length:] if history_length > 0 else []
-    if recent_history:
-        history_text = "\n\n".join(
-            (
-                f"Step {item['step_index'] + 1}\n"
-                f"Action: {item['action']}\n"
-                f"Observation: {item['observation']}"
-            )
-            for item in recent_history
+    """Build one action prompt using OPID's text-only ALFWorld format."""
+    action_text = "\n ".join(f"'{action}'" for action in admissible_actions if action != "help")
+    if step_index == 0 or history_length <= 0:
+        return ALFWORLD_TEMPLATE_NO_HIS.format(
+            current_observation=observation,
+            admissible_actions=action_text,
         )
-    else:
-        history_text = "No previous actions."
 
-    action_text = "\n".join(f"- {action}" for action in admissible_actions if action != "help")
-    return (
-        "You are an agent operating in the text-only ALFWorld environment.\n"
-        f"Task: {task_description}\n"
-        f"Current step: {step_index + 1}\n"
-        f"Recent history:\n{history_text}\n\n"
-        f"Current observation: {observation}\n"
-        f"Admissible actions:\n{action_text}\n\n"
-        "Choose exactly one admissible action. Reply with only <action>your action</action>."
+    recent_history = history[-history_length:]
+    valid_history_length = len(recent_history)
+    start_index = len(history) - valid_history_length
+    history_text = "\n".join(
+        (
+            f"[Observation {start_index + history_offset + 1}: "
+            f"'{item['prompt_observation']}', Action {start_index + history_offset + 1}: '{item['action']}']"
+        )
+        for history_offset, item in enumerate(recent_history)
+    )
+    return ALFWORLD_TEMPLATE.format(
+        task_description=task_description,
+        step_count=len(history),
+        history_length=valid_history_length,
+        action_history=history_text,
+        current_step=step_index + 1,
+        current_observation=observation,
+        admissible_actions=action_text,
     )
 
 
@@ -271,6 +288,8 @@ class ALFWorldAgentLoop(AgentLoopBase):
         history_length: int = 5,
         max_action_tokens: int = 128,
         teacher_critique_max_tokens: int = 256,
+        teacher_critique_min_confidence: float = 0.1,
+        teacher_critique_reject_log_path: Optional[str] = None,
         teacher_prompt_builder: Optional[TeacherPromptBuilder] = None,
         environment_factory: Optional[Any] = None,
         **kwargs,
@@ -286,6 +305,13 @@ class ALFWorldAgentLoop(AgentLoopBase):
         self.history_length = int(history_length)
         self.max_action_tokens = int(max_action_tokens)
         self.teacher_critique_max_tokens = int(teacher_critique_max_tokens)
+        self.teacher_critique_min_confidence = float(teacher_critique_min_confidence)
+        self.teacher_critique_reject_log_path = (
+            str(teacher_critique_reject_log_path)
+            if teacher_critique_reject_log_path is not None
+            and str(teacher_critique_reject_log_path).lower() not in {"", "none", "null"}
+            else None
+        )
         self.response_length = self.rollout_config.response_length
         self.teacher_prompt_builder = teacher_prompt_builder or ALFWorldCritiqueTeacherPromptBuilder()
         self.environment_factory = environment_factory or InstalledALFWorldEnvironmentFactory(
@@ -299,6 +325,11 @@ class ALFWorldAgentLoop(AgentLoopBase):
         if self.teacher_critique_max_tokens <= 0:
             raise ValueError(
                 f"teacher_critique_max_tokens must be positive, got {self.teacher_critique_max_tokens}."
+            )
+        if not 0.0 <= self.teacher_critique_min_confidence <= 1.0:
+            raise ValueError(
+                "teacher_critique_min_confidence must be in [0, 1], "
+                f"got {self.teacher_critique_min_confidence}."
             )
         if self.response_length < 2:
             raise ValueError(f"rollout.response_length must be at least 2, got {self.response_length}.")
@@ -348,6 +379,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
             initial_observation, reset_info = await self.loop.run_in_executor(None, environment.reset)
             task_description = extract_task_description(initial_observation)
             admissible_actions = list(reset_info.get("admissible_commands", []))
+            initial_admissible_actions = list(admissible_actions)
             task_uid = str(
                 reset_info.get("extra.gamefile")
                 or reset_info.get("gamefile")
@@ -364,19 +396,21 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 history_length=self.history_length,
             )
             student_prompt_ids = await self.apply_chat_template([{"role": "user", "content": initial_prompt}])
+            current_prompt_ids = student_prompt_ids
+            current_observation = initial_observation
 
             for step_index in range(self.max_steps):
                 remaining_tokens = self.response_length - len(response_ids)
-                if remaining_tokens <= 1:
+                if remaining_tokens <= 0:
                     termination_reason = "response_length"
                     break
 
                 turn_sampling_params = dict(sampling_params)
-                turn_sampling_params["max_tokens"] = min(self.max_action_tokens, remaining_tokens - 1)
+                turn_sampling_params["max_tokens"] = min(self.max_action_tokens, remaining_tokens)
                 started = time.perf_counter()
                 output: TokenOutput = await self.server_manager.generate(
                     request_id=uuid4().hex,
-                    prompt_ids=student_prompt_ids + response_ids,
+                    prompt_ids=current_prompt_ids,
                     sampling_params=turn_sampling_params,
                 )
                 generate_seconds += time.perf_counter() - started
@@ -386,7 +420,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 elif output.extra_fields.get("max_global_steps") is not None:
                     server_extra_fields["max_global_steps"] = output.extra_fields["max_global_steps"]
 
-                generated_ids = list(output.token_ids[: remaining_tokens - 1])
+                generated_ids = list(output.token_ids[:remaining_tokens])
                 if not generated_ids:
                     termination_reason = "empty_generation"
                     break
@@ -410,6 +444,8 @@ class ALFWorldAgentLoop(AgentLoopBase):
                     "task_uid": task_uid,
                     "trajectory_uid": trajectory_uid,
                     "step_index": step_index,
+                    "prompt_observation": current_observation,
+                    "admissible_actions_before": list(admissible_actions),
                     "model_output": model_text,
                     "action": parsed_action.action,
                     "observation": transition.observation,
@@ -423,14 +459,23 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 history.append(history_item)
                 admissible_actions = list(transition.info.get("admissible_commands", []))
 
+                if transition.done:
+                    termination_reason = "success" if bool(transition.info.get("won", False)) else "failure"
+                    break
+                if len(response_ids) >= self.response_length:
+                    termination_reason = "response_length"
+                    break
+
+                current_observation = transition.observation
                 observation_prompt = build_alfworld_prompt(
                     task_description=task_description,
-                    observation=transition.observation,
+                    observation=current_observation,
                     admissible_actions=admissible_actions,
                     history=history,
                     step_index=step_index + 1,
                     history_length=self.history_length,
                 )
+                current_prompt_ids = await self.apply_chat_template([{"role": "user", "content": observation_prompt}])
                 observation_ids = await self.apply_chat_template(
                     [{"role": "user", "content": observation_prompt}],
                     remove_system_prompt=True,
@@ -441,9 +486,6 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 if logprobs_available:
                     response_logprobs.extend([0.0] * len(observation_ids))
 
-                if transition.done:
-                    termination_reason = "success" if bool(transition.info.get("won", False)) else "failure"
-                    break
                 if len(response_ids) >= self.response_length:
                     termination_reason = "response_length"
                     break
@@ -455,6 +497,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 critique_messages = self.teacher_prompt_builder.build_critique_messages(
                     task_description=task_description,
                     initial_observation=initial_observation,
+                    initial_admissible_actions=initial_admissible_actions,
                     trajectory_steps=history,
                     task_uid=task_uid,
                     trajectory_uid=trajectory_uid,
@@ -463,6 +506,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 teacher_prompt_template = self.teacher_prompt_builder.build_scoring_prompt_template(
                     task_description=task_description,
                     initial_observation=initial_observation,
+                    initial_admissible_actions=initial_admissible_actions,
                     trajectory_steps=history,
                     task_uid=task_uid,
                     trajectory_uid=trajectory_uid,
@@ -508,6 +552,8 @@ class ALFWorldAgentLoop(AgentLoopBase):
             fallback_error_step=fallback_error_step,
             opd_eligible=opd_eligible,
             teacher_critique_max_tokens=self.teacher_critique_max_tokens,
+            teacher_critique_min_confidence=self.teacher_critique_min_confidence,
+            teacher_critique_reject_log_path=self.teacher_critique_reject_log_path,
             response_ids=response_ids,
             response_mask=response_mask,
             response_logprobs=response_logprobs if logprobs_available else None,

@@ -15,22 +15,112 @@
 
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 
 ERROR_STEP_PATTERN = re.compile(r"<error_step>\s*(\d+)\s*</error_step>", flags=re.IGNORECASE)
+REASON_PATTERN = re.compile(r"<reason>\s*(.*?)\s*</reason>", flags=re.IGNORECASE | re.DOTALL)
+BETTER_DECISION_PATTERN = re.compile(
+    r"<better_decision>\s*(.*?)\s*</better_decision>", flags=re.IGNORECASE | re.DOTALL
+)
+CONFIDENCE_PATTERN = re.compile(
+    r"<confidence>\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*</confidence>",
+    flags=re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class TeacherCritiqueFeedback:
+    """Parsed structured hindsight feedback from the teacher."""
+
+    error_step: int
+    """Zero-based index of the earliest critical error."""
+    reason: str
+    """Why the selected step is the earliest critical error."""
+    better_decision: str
+    """A better action or decision at the selected step."""
+    confidence: float
+    """Teacher confidence that ``error_step`` is the earliest critical error, in [0, 1]."""
+    parse_ok: bool
+    """Whether all required feedback fields were present and valid."""
+    parse_errors: tuple[str, ...]
+    """Human-readable parse failures; empty when ``parse_ok`` is true."""
+
+
+def _parse_required_tagged_text(pattern: re.Pattern[str], critique: str, field_name: str) -> tuple[str, str | None]:
+    match = pattern.search(critique)
+    if match is None:
+        return "", f"missing <{field_name}>"
+    value = match.group(1).strip()
+    if not value:
+        return "", f"empty <{field_name}>"
+    return value, None
+
+
+def parse_critique_feedback(
+    critique: str,
+    *,
+    num_steps: int,
+    fallback_step: int,
+) -> TeacherCritiqueFeedback:
+    """Parse structured teacher feedback, using safe fallbacks for malformed fields."""
+    if num_steps <= 0:
+        raise ValueError("Cannot select an error step from an empty trajectory.")
+
+    parse_errors: list[str] = []
+    error_step = min(max(fallback_step, 0), num_steps - 1)
+    match = ERROR_STEP_PATTERN.search(critique)
+    if match is None:
+        parse_errors.append("missing <error_step>")
+    else:
+        parsed_step = int(match.group(1)) - 1
+        if 0 <= parsed_step < num_steps:
+            error_step = parsed_step
+        else:
+            parse_errors.append(f"<error_step> {parsed_step + 1} out of range 1..{num_steps}")
+
+    reason, reason_error = _parse_required_tagged_text(REASON_PATTERN, critique, "reason")
+    if reason_error is not None:
+        parse_errors.append(reason_error)
+        reason = "The failed attempt did not make the correct progress toward the task."
+
+    better_decision, better_decision_error = _parse_required_tagged_text(
+        BETTER_DECISION_PATTERN,
+        critique,
+        "better_decision",
+    )
+    if better_decision_error is not None:
+        parse_errors.append(better_decision_error)
+        better_decision = "Choose a valid action that makes direct progress toward the task."
+
+    confidence = 0.0
+    confidence_match = CONFIDENCE_PATTERN.search(critique)
+    if confidence_match is None:
+        parse_errors.append("missing or malformed <confidence>")
+    else:
+        confidence = float(confidence_match.group(1))
+        if not 0.0 <= confidence <= 1.0:
+            parse_errors.append(f"<confidence> {confidence} out of range [0, 1]")
+            confidence = min(max(confidence, 0.0), 1.0)
+
+    return TeacherCritiqueFeedback(
+        error_step=error_step,
+        reason=reason,
+        better_decision=better_decision,
+        confidence=confidence,
+        parse_ok=not parse_errors,
+        parse_errors=tuple(parse_errors),
+    )
 
 
 def parse_critique_error_step(critique: str, *, num_steps: int, fallback_step: int) -> int:
     """Return a zero-based error step, falling back when teacher output is malformed."""
-    if num_steps <= 0:
-        raise ValueError("Cannot select an error step from an empty trajectory.")
-    match = ERROR_STEP_PATTERN.search(critique)
-    if match is not None:
-        parsed_step = int(match.group(1)) - 1
-        if 0 <= parsed_step < num_steps:
-            return parsed_step
-    return min(max(fallback_step, 0), num_steps - 1)
+    return parse_critique_feedback(
+        critique,
+        num_steps=num_steps,
+        fallback_step=fallback_step,
+    ).error_step
 
 
 class TeacherPromptBuilder(ABC):
@@ -39,8 +129,9 @@ class TeacherPromptBuilder(ABC):
     The first prompt asks the teacher to locate the earliest error in a failed
     student trajectory and produce privileged critique ``c``. The second is a
     template for the prompt under which the teacher scores the original student
-    response token IDs. Only ``c`` is substituted into that template; the student
-    response is appended later without decoding or re-tokenizing it.
+    response token IDs. The parsed error step, reason, better decision, and
+    confidence are substituted into that template; the student response is appended later
+    without decoding or re-tokenizing it.
     """
 
     @abstractmethod
@@ -49,22 +140,39 @@ class TeacherPromptBuilder(ABC):
 
     @abstractmethod
     def build_scoring_prompt_template(self, **context: Any) -> str:
-        """Return a text template containing exactly one ``{critique}`` field."""
+        """Return a template with ``error_step``, ``reason``, ``better_decision``, and ``confidence`` fields."""
 
 
 def format_alfworld_trajectory(trajectory_steps: list[dict[str, Any]]) -> str:
     """Format an ALFWorld trajectory for teacher diagnosis."""
-    return "\n\n".join(
-        (
-            f"Step {step['step_index'] + 1}\n"
-            f"Student model output: {step['model_output']}\n"
-            f"Executed action: {step['action']}\n"
-            f"Environment observation: {step['observation']}\n"
-            f"Action accepted by environment: {step['admissible']}\n"
-            f"Task solved after this step: {step['won']}"
+    formatted_steps = []
+    for step in trajectory_steps:
+        step_number = step["step_index"] + 1
+        admissible_actions_before = step.get("admissible_actions_before", [])
+        formatted_steps.append(
+            f"Step {step_number}\n"
+            f"Environment observation before Action {step_number}:\n"
+            f"{step['prompt_observation']}\n\n"
+            f"Admissible actions before Action {step_number}:\n"
+            f"{format_admissible_actions(admissible_actions_before)}\n\n"
+            f"Student output for Action {step_number}:\n"
+            f"{step['model_output']}\n\n"
+            f"Parsed student action {step_number}:\n"
+            f"{step['action']}\n\n"
+            f"Environment observation after Action {step_number}:\n"
+            f"{step['observation']}\n\n"
+            f"Action output format valid: {step['format_valid']}\n"
+            f"Task solved after Action {step_number}: {step['won']}"
         )
-        for step in trajectory_steps
-    )
+    return "\n\n".join(formatted_steps)
+
+
+def format_admissible_actions(admissible_actions: list[str]) -> str:
+    """Format an ALFWorld admissible-action list for a teacher prompt."""
+    actions = [action for action in admissible_actions if action != "help"]
+    if not actions:
+        return "(none provided)"
+    return "\n".join(f"- {action}" for action in actions)
 
 
 class ALFWorldCritiqueTeacherPromptBuilder(TeacherPromptBuilder):
@@ -75,6 +183,7 @@ class ALFWorldCritiqueTeacherPromptBuilder(TeacherPromptBuilder):
         *,
         task_description: str,
         initial_observation: str,
+        initial_admissible_actions: list[str],
         trajectory_steps: list[dict[str, Any]],
         **context: Any,
     ) -> list[dict[str, str]]:
@@ -84,19 +193,40 @@ class ALFWorldCritiqueTeacherPromptBuilder(TeacherPromptBuilder):
             "You are diagnosing a failed text-only ALFWorld trajectory.\n"
             f"Task: {task_description}\n\n"
             f"Initial environment observation: {initial_observation}\n\n"
+            "Initial admissible actions:\n"
+            f"{format_admissible_actions(initial_admissible_actions)}\n\n"
             f"Failed student trajectory:\n{trajectory}\n\n"
             "Find the earliest student step that made the trajectory incorrect or prevented task completion. "
             "Use one-based step numbering and return exactly this structure:\n"
             "<error_step>N</error_step>\n"
-            "<critique>A concise explanation of the error and the better decision at that step.</critique>"
+            "<reason>A concise explanation of why this is the earliest critical error.</reason>\n"
+            "<better_decision>The better action or decision at that step.</better_decision>\n"
+            "<confidence>A number from 0.0 to 1.0 indicating how confident you are that this is the earliest "
+            "critical error.</confidence>"
         )
         return [{"role": "user", "content": content}]
 
-    def build_scoring_prompt_template(self, *, task_description: str, **context: Any) -> str:
+    def build_scoring_prompt_template(
+        self,
+        *,
+        task_description: str,
+        initial_observation: str,
+        initial_admissible_actions: list[str],
+        **context: Any,
+    ) -> str:
         del context
         return (
-            "You are acting in the text-only ALFWorld environment.\n"
-            f"Task: {task_description}\n\n"
-            "Privileged diagnosis of a failed attempt:\n{critique}\n\n"
-            "Using this diagnosis as private guidance, produce the ALFWorld interaction trajectory."
+            "Task:\n"
+            f"{task_description}\n\n"
+            "Private hindsight feedback from a failed attempt:\n\n"
+            "Earliest critical error: step {error_step}.\n"
+            "Reason: {reason}\n"
+            "Better decision: {better_decision}\n"
+            "Confidence: {confidence}\n\n"
+            "Use this feedback silently when choosing actions.\n"
+            "Do not mention the feedback.\n\n"
+            "Initial observation:\n"
+            f"{initial_observation}\n\n"
+            "Initial admissible actions:\n"
+            f"{format_admissible_actions(initial_admissible_actions)}\n\n"
         )

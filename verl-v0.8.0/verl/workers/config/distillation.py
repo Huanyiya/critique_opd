@@ -114,11 +114,8 @@ class DistillationLossConfig(BaseConfig):
         if self.loss_mode == "reverse_kl_full_vocab":
             if self.use_policy_gradient:
                 raise ValueError(
-                    "reverse_kl_full_vocab must be directly backpropagated with use_policy_gradient=False."
-                )
-            if self.log_prob_min_clamp is not None or self.loss_max_clamp is not None:
-                raise ValueError(
-                    "Exact reverse_kl_full_vocab requires log_prob_min_clamp=null and loss_max_clamp=null."
+                    "reverse_kl_full_vocab selected-token OPD must be directly backpropagated with "
+                    "use_policy_gradient=False."
                 )
 
 
@@ -191,7 +188,7 @@ class DistillationTeacherModelConfig(BaseConfig):
         if not use_topk and not use_full_vocab:
             return
         if use_topk and use_full_vocab:
-            raise ValueError("Teacher log-prob output cannot be both top-k and full-vocabulary.")
+            raise ValueError("Teacher log-prob output cannot be both top-k and selected-token OPD.")
         if topk is None:
             if use_topk:
                 raise ValueError("topk must be specified when use_topk is True.")
@@ -199,20 +196,9 @@ class DistillationTeacherModelConfig(BaseConfig):
         engine_name = self.inference.name
         engine_kwargs = self.inference.engine_kwargs
         if use_full_vocab:
-            if engine_name != "vllm":
-                raise NotImplementedError(
-                    "Full-vocabulary teacher log probabilities currently require the vLLM engine, "
-                    f"but got {engine_name}."
-                )
-            vllm_engine_kwargs = dict(engine_kwargs.get("vllm", {}))
-            max_logprobs = vllm_engine_kwargs.get("max_logprobs")
-            if max_logprobs not in (None, -1):
-                raise ValueError(
-                    "reverse_kl_full_vocab requires "
-                    "distillation.teacher_models.<teacher>.inference.engine_kwargs.vllm.max_logprobs=-1."
-                )
-            vllm_engine_kwargs["max_logprobs"] = -1
-            engine_kwargs["vllm"] = vllm_engine_kwargs
+            # Historical name: this OPD path no longer asks the teacher for a
+            # dense full-vocabulary distribution.  It requests prompt_logprobs=0
+            # and keeps only the logprob of the original student-selected token.
             return
 
         assert topk is not None

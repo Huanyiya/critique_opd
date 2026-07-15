@@ -9,5 +9,7 @@
   history_length: ${oc.decode:${oc.env:ALFWORLD_HISTORY_LENGTH,5}}
   max_action_tokens: ${oc.decode:${oc.env:ALFWORLD_MAX_ACTION_TOKENS,128}}
   teacher_critique_max_tokens: ${oc.decode:${oc.env:ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS,256}}
+  teacher_critique_min_confidence: ${oc.decode:${oc.env:ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE,0.1}}
+  teacher_critique_reject_log_path: ${oc.env:ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH,null}
   teacher_prompt_builder:
     _target_: verl.experimental.agent_loop.teacher_prompt.ALFWorldCritiqueTeacherPromptBuilder

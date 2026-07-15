@@ -399,12 +399,11 @@ def compute_reverse_kl_full_vocab(
     model_output: dict,
     data: TensorDict,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Return exact token-wise ``KL(student || teacher)`` over the full vocabulary.
+    """Return selected-token OPD losses for the original student response tokens.
 
-    The vocabulary reduction is performed inside the FSDP logits processor while
-    the student's differentiable logits are still available.  This function only
-    maps those per-sequence-position losses back to response positions for native
-    veRL aggregation with ``response_mask``.
+    The historical loss-mode name is kept for config compatibility, but the
+    actor-side logits processor now gathers only the student-selected token at
+    each trainable response position instead of reducing over the whole vocabulary.
     """
     del config, distillation_config
     distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)

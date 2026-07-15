@@ -51,20 +51,20 @@ class _FakeTokenizer:
         self.seen_contents.append(content)
         if "diagnosing a failed text-only ALFWorld trajectory" in content:
             return [301, 302]
-        if "Current step: 1" in content:
+        if "Your current observation is: You are in a kitchen." in content:
             return [101, 102]
-        if "Current step: 2" in content:
+        if "You are now at step 2" in content:
             return [201, 202]
-        if "Current step: 3" in content:
+        if "You are now at step 3" in content:
             return [203, 204]
         raise AssertionError(f"Unexpected prompt: {content}")
 
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
         del skip_special_tokens
         if ids == [11, 12]:
-            return "<action>look</action>"
+            return "<think>I should inspect the room.</think><action>look</action>"
         if ids == [21, 22]:
-            return "<action>take apple</action>"
+            return "<think>The apple is the target object.</think><action>take apple</action>"
         return "malformed"
 
 
@@ -174,11 +174,12 @@ def test_alfworld_rollout_preserves_response_tokens_and_masks_observations():
     assert output.opd_eligible is False
     assert output.teacher_critique_prompt_ids == []
     assert output.response_step_end_indices == [2, 6]
-    assert output.response_ids == [11, 12, 201, 202, 21, 22, 203, 204]
-    assert output.response_mask == [1, 1, 0, 0, 1, 1, 0, 0]
-    assert output.response_logprobs == [-0.1, -0.1, 0.0, 0.0, -0.1, -0.1, 0.0, 0.0]
-    # The second student turn consumes the original first-turn token IDs directly.
-    assert server.calls[1] == [101, 102, 11, 12, 201, 202]
+    assert output.response_ids == [11, 12, 201, 202, 21, 22]
+    assert output.response_mask == [1, 1, 0, 0, 1, 1]
+    assert output.response_logprobs == [-0.1, -0.1, 0.0, 0.0, -0.1, -0.1]
+    # OPID-style rollout regenerates from the current step prompt, not accumulated trajectory tokens.
+    assert server.calls[0] == [101, 102]
+    assert server.calls[1] == [201, 202]
     assert environment.actions == ["look", "take apple"]
     assert environment.closed
 
@@ -207,11 +208,13 @@ def test_alfworld_rollout_terminates_at_max_steps():
     assert output.opd_eligible is True
     assert output.teacher_critique_prompt_ids == [301, 302]
     assert output.response_step_end_indices == [2]
-    assert output.teacher_prompt_template.count("{critique}") == 1
-    assert "Task: put the apple on the table" in output.teacher_prompt_template
+    assert output.teacher_prompt_template.count("{error_step}") == 1
+    assert output.teacher_prompt_template.count("{reason}") == 1
+    assert output.teacher_prompt_template.count("{better_decision}") == 1
+    assert "Task:\nput the apple on the table" in output.teacher_prompt_template
     critique_prompt = tokenizer.seen_contents[-1]
     assert "Task: put the apple on the table" in critique_prompt
-    assert "Student model output: <action>look</action>" in critique_prompt
+    assert "Student model output: <think>I should inspect the room.</think><action>look</action>" in critique_prompt
     assert "Executed action: look" in critique_prompt
     assert "Environment observation: observation 1" in critique_prompt
     assert environment.closed

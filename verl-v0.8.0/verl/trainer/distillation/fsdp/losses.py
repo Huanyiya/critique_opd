@@ -57,47 +57,47 @@ def compute_reverse_kl_full_vocab(
     data: TensorDict,
     config: DistillationConfig,
 ) -> dict[str, torch.Tensor]:
-    """Compute exact full-vocabulary ``KL(student || teacher)`` on selected response tokens.
+    """Compute selected-token OPD on the original student response tokens.
 
-    Teacher rows are stored only for response positions whose ``response_mask`` is
-    one. ``teacher_response_indices`` maps each row back to its response-local token
-    index. This keeps teacher prompts, environment observations, and successful
-    trajectories out of the large full-vocabulary tensor.
+    This keeps the historical ``reverse_kl_full_vocab`` entry point, but no
+    longer reduces over the whole vocabulary.  Teacher rows are stored only for
+    response positions whose ``response_mask`` is one, and each row contains the
+    teacher logprob of the exact token sampled by the student at that position.
     """
     if get_ulysses_sequence_parallel_world_size() != 1:
         raise NotImplementedError(
-            "reverse_kl_full_vocab does not yet support Ulysses sequence parallelism; "
+            "reverse_kl_full_vocab selected-token OPD does not yet support Ulysses sequence parallelism; "
             "set actor_rollout_ref.actor.ulysses_sequence_parallel_size=1."
         )
     if not teacher_full_log_probs.is_nested or not teacher_response_indices.is_nested:
-        raise ValueError("Full-vocabulary teacher log probabilities and response indices must be nested tensors.")
+        raise ValueError("Selected-token teacher log probabilities and response indices must be nested tensors.")
     if student_logits.shape[0] != 1:
         raise ValueError(f"Expected flattened FSDP logits with batch dimension 1, got {student_logits.shape}.")
 
     student_logits_flat = student_logits.squeeze(0)
+    input_ids_flat = data["input_ids"].values()
     input_offsets = data["input_ids"].offsets()
     prompt_lengths = _prompt_lengths(data).to(device=input_offsets.device, dtype=torch.int64)
     teacher_rows = teacher_full_log_probs.unbind()
     response_indices = teacher_response_indices.unbind()
     if not (len(teacher_rows) == len(response_indices) == prompt_lengths.numel()):
         raise ValueError(
-            "Teacher full-vocabulary batch size must match the student batch: "
+            "Teacher selected-token batch size must match the student batch: "
             f"rows={len(teacher_rows)}, indices={len(response_indices)}, batch={prompt_lengths.numel()}."
         )
 
     predictor_positions = []
-    selected_teacher_rows = []
+    selected_teacher_logprobs = []
     for sample_idx, (sample_teacher, sample_indices) in enumerate(zip(teacher_rows, response_indices, strict=True)):
         if sample_teacher.shape[0] != sample_indices.numel():
             raise ValueError(
                 f"Sample {sample_idx} has {sample_teacher.shape[0]} teacher rows but "
                 f"{sample_indices.numel()} response indices."
             )
-        if sample_teacher.shape[-1] != student_logits_flat.shape[-1]:
+        if sample_teacher.dim() != 2 or sample_teacher.shape[-1] != 1:
             raise ValueError(
-                "Teacher and student vocabularies must have identical size and token-id ordering for "
-                f"full-vocabulary KL, got teacher={sample_teacher.shape[-1]} and "
-                f"student={student_logits_flat.shape[-1]}."
+                "Selected-token teacher log probabilities must have shape [num_selected_tokens, 1], "
+                f"got {sample_teacher.shape} for sample {sample_idx}."
             )
         if sample_indices.numel() == 0:
             continue
@@ -111,26 +111,33 @@ def compute_reverse_kl_full_vocab(
         predictor_positions.append(
             input_offsets[sample_idx] + prompt_lengths[sample_idx] - 1 + sample_indices_device
         )
-        selected_teacher_rows.append(sample_teacher)
+        selected_teacher_logprobs.append(sample_teacher.squeeze(-1))
 
     # Keep an empty OPD microbatch connected to the current forward pass.
     if not predictor_positions:
         return {"distillation_losses": (student_logits_flat.sum(dim=-1) * 0.0).unsqueeze(0)}
 
     predictor_positions = torch.cat(predictor_positions)
-    teacher_log_probs = torch.cat(selected_teacher_rows, dim=0).to(student_logits_flat.device).float()
-    student_log_probs = F.log_softmax(student_logits_flat.index_select(0, predictor_positions).float(), dim=-1)
-    if teacher_log_probs.shape != student_log_probs.shape:
+    teacher_token_log_probs = torch.cat(selected_teacher_logprobs, dim=0).to(student_logits_flat.device).float()
+    selected_token_ids = input_ids_flat.index_select(0, predictor_positions + 1).to(
+        device=student_logits_flat.device,
+        dtype=torch.int64,
+    )
+    student_token_log_probs = F.log_softmax(
+        student_logits_flat.index_select(0, predictor_positions).float(),
+        dim=-1,
+    ).gather(dim=-1, index=selected_token_ids.unsqueeze(-1)).squeeze(-1)
+    if teacher_token_log_probs.shape != student_token_log_probs.shape:
         raise ValueError(
-            f"Teacher/student full-vocabulary rows do not align: {teacher_log_probs.shape} vs "
-            f"{student_log_probs.shape}."
+            f"Teacher/student selected-token rows do not align: {teacher_token_log_probs.shape} vs "
+            f"{student_token_log_probs.shape}."
         )
 
     loss_config: DistillationLossConfig = config.distillation_loss
     if loss_config.log_prob_min_clamp is not None:
-        teacher_log_probs = teacher_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-        student_log_probs = student_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-    reverse_kl = (student_log_probs.exp() * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+        teacher_token_log_probs = teacher_token_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+        student_token_log_probs = student_token_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+    reverse_kl = student_token_log_probs.exp() * (student_token_log_probs - teacher_token_log_probs)
 
     token_losses = student_logits_flat.sum(dim=-1) * 0.0
     token_losses = token_losses.index_copy(0, predictor_positions, reverse_kl)

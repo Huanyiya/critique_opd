@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -37,7 +36,10 @@ def _get_teacher_sampling_params(
         raise NotImplementedError("vLLM does not support temperature for prompt_logprobs.")
 
     if distillation_loss_config.loss_settings.use_full_vocab:
-        num_logprobs = -1
+        # The OPD "full-vocab" path now uses only the original student-selected
+        # token at each trainable response position.  Requesting
+        # prompt_logprobs=0 asks the server for exactly that token logprob.
+        num_logprobs = 0
     elif distillation_loss_config.loss_settings.use_topk:
         num_logprobs = distillation_loss_config.topk
     else:
@@ -220,10 +222,14 @@ class AsyncTeacherLLMServerManager:
         return teacher_ids, teacher_logprobs
 
     def empty_teacher_full_vocab_outputs(self, *, vocab_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build zero-row full-vocabulary tensors for a trajectory excluded from OPD."""
+        """Build zero-row selected-token teacher tensors for a trajectory excluded from OPD.
+
+        ``vocab_size`` is kept in the signature for compatibility with the old
+        full-vocabulary path; selected-token OPD stores one logprob per row.
+        """
         if vocab_size <= 0:
             raise ValueError(f"vocab_size must be positive, got {vocab_size}.")
-        return torch.empty((0,), dtype=torch.int64), torch.empty((0, vocab_size), dtype=torch.float32)
+        return torch.empty((0,), dtype=torch.int64), torch.empty((0, 1), dtype=torch.float32)
 
     async def generate_teacher_critique_single(
         self,
@@ -289,9 +295,9 @@ class AsyncTeacherLLMServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute full-vocabulary teacher distributions for trainable response tokens only."""
+        """Compute teacher logprobs for the original student-selected response tokens only."""
         if not self.uses_full_vocab:
-            raise RuntimeError("compute_teacher_full_vocab_logprobs_single requires a full-vocabulary loss mode.")
+            raise RuntimeError("compute_teacher_full_vocab_logprobs_single requires the OPD selected-token mode.")
         if len(sequence_ids) != teacher_prompt_length + len(response_mask):
             raise ValueError(
                 "Teacher sequence must be teacher prompt plus the exact student response, got "
@@ -302,42 +308,49 @@ class AsyncTeacherLLMServerManager:
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
         if teacher_model_config.inference.temperature != 1.0:
-            raise NotImplementedError("vLLM full-vocabulary logprobs require teacher temperature 1.0.")
+            raise NotImplementedError("Teacher selected-token prompt_logprobs require teacher temperature 1.0.")
         client = self.teacher_client[teacher_key]
         response_indices = torch.tensor(
             [index for index, mask_value in enumerate(response_mask) if bool(mask_value)], dtype=torch.int64
         )
         if response_indices.numel() == 0:
             raise ValueError(
-                "Full-vocabulary teacher scoring received no trainable response tokens. "
+                "Teacher selected-token scoring received no trainable response tokens. "
                 "Excluded OPD trajectories should use empty_teacher_full_vocab_outputs instead."
             )
 
-        async def score_response_position(response_index: int) -> list[float]:
-            # The context ends immediately before the original student token at
-            # response_index. vLLM generates one ignored dummy token solely to
-            # expose the complete next-token distribution.
-            context_end = teacher_prompt_length + response_index
-            teacher_output = await client.generate(
-                request_id=uuid4().hex,
-                prompt_ids=sequence_ids[:context_end],
-                sampling_params={
-                    "max_tokens": 1,
-                    "temperature": teacher_model_config.inference.temperature,
-                    "logprobs": -1,
-                },
-                image_data=multi_modal_data.get("images"),
-                video_data=multi_modal_data.get("videos"),
-                audio_data=multi_modal_data.get("audios"),
-                mm_processor_kwargs=mm_processor_kwargs,
+        teacher_output = await client.generate(
+            request_id=uuid4().hex,
+            prompt_ids=sequence_ids,
+            sampling_params={
+                "max_tokens": 1,
+                "temperature": teacher_model_config.inference.temperature,
+                "prompt_logprobs": 0,
+            },
+            image_data=multi_modal_data.get("images"),
+            video_data=multi_modal_data.get("videos"),
+            audio_data=multi_modal_data.get("audios"),
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int64)
+        teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"], dtype=torch.float32)
+        if teacher_ids.shape != teacher_logprobs.shape or teacher_ids.shape != (len(sequence_ids), 1):
+            raise ValueError(
+                "Teacher selected-token prompt_logprobs must have shape [teacher_prompt + response, 1], "
+                f"got ids={teacher_ids.shape}, logprobs={teacher_logprobs.shape}."
             )
-            rows = teacher_output.extra_fields.get("sample_full_logprobs")
-            if rows is None or len(rows) != 1:
-                raise ValueError("vLLM must return exactly one full-vocabulary row per OPD scoring request.")
-            return rows[0]
 
-        rows = await asyncio.gather(*(score_response_position(index) for index in response_indices.tolist()))
-        vocab_size = len(rows[0])
-        if vocab_size <= 0 or any(len(row) != vocab_size for row in rows):
-            raise ValueError("vLLM returned inconsistent or empty full-vocabulary rows.")
-        return response_indices, torch.tensor(rows, dtype=torch.float32)
+        teacher_predictor_rows = teacher_prompt_length - 1 + response_indices
+        selected_teacher_ids = teacher_ids.index_select(0, teacher_predictor_rows).squeeze(-1)
+        selected_response_ids = torch.tensor(
+            [sequence_ids[teacher_prompt_length + index] for index in response_indices.tolist()],
+            dtype=torch.int64,
+        )
+        if not torch.equal(selected_teacher_ids.cpu(), selected_response_ids):
+            raise ValueError(
+                "Teacher selected-token prompt_logprobs are not aligned with the original student response tokens: "
+                f"teacher_ids={selected_teacher_ids.tolist()}, response_ids={selected_response_ids.tolist()}."
+            )
+
+        selected_teacher_logprobs = teacher_logprobs.index_select(0, teacher_predictor_rows)
+        return response_indices, selected_teacher_logprobs

@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import os
 import random
@@ -95,7 +96,7 @@ class AgentLoopOutput(BaseModel):
     teacher_critique_prompt_ids: Optional[list[int]] = None
     """Prompt under which the teacher generates privileged critique ``c``."""
     teacher_prompt_template: Optional[str] = None
-    """Scoring-prompt template containing a ``{critique}`` placeholder."""
+    """Scoring-prompt template populated from parsed privileged critique fields."""
     response_step_end_indices: Optional[list[int]] = None
     """Exclusive response-token end index for each student action step."""
     fallback_error_step: int = 0
@@ -104,6 +105,10 @@ class AgentLoopOutput(BaseModel):
     """Whether this trajectory is an incorrect trajectory selected for OPD."""
     teacher_critique_max_tokens: int = 256
     """Maximum number of tokens generated for privileged critique."""
+    teacher_critique_min_confidence: float = 0.1
+    """Minimum teacher confidence required for a failed trajectory to participate in OPD."""
+    teacher_critique_reject_log_path: Optional[str] = None
+    """Text file used to record failed trajectories rejected by teacher critique parsing/confidence."""
     response_ids: list[int]
     """Response token ids including LLM generated token, tool response token."""
     response_mask: list[int]
@@ -139,6 +144,8 @@ class AgentLoopOutput(BaseModel):
             "fallback_error_step",
             "opd_eligible",
             "teacher_critique_max_tokens",
+            "teacher_critique_min_confidence",
+            "teacher_critique_reject_log_path",
         ):
             output.pop(field, None)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
@@ -943,6 +950,111 @@ class AgentLoopWorker:
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
 
+    def _populate_empty_teacher_outputs(self, output: AgentLoopOutput, prompt_ids: list[int]) -> None:
+        """Attach shape-compatible empty teacher outputs for trajectories excluded from OPD."""
+        if getattr(self.teacher_server_manager, "uses_full_vocab", False):
+            teacher_response_indices, teacher_full_logprobs = (
+                self.teacher_server_manager.empty_teacher_full_vocab_outputs(
+                    vocab_size=len(self.tokenizer),
+                )
+            )
+            output.extra_fields["teacher_response_indices"] = teacher_response_indices
+            output.extra_fields["teacher_full_logprobs"] = teacher_full_logprobs
+            return
+
+        teacher_ids, teacher_logprobs = self.teacher_server_manager.empty_teacher_outputs(
+            sequence_length=len(prompt_ids) + len(output.response_ids),
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        output.extra_fields["teacher_ids"] = teacher_ids
+        output.extra_fields["teacher_logprobs"] = teacher_logprobs
+
+    def _exclude_from_opd_training(self, output: AgentLoopOutput, prompt_ids: list[int], reason: str) -> None:
+        """Keep the rollout for logging/eval but remove all OPD training tokens."""
+        output.response_mask = [0] * len(output.response_ids)
+        output.extra_fields["opd_selected"] = False
+        output.extra_fields["opd_skip_reason"] = reason
+        self._populate_empty_teacher_outputs(output, prompt_ids)
+
+    def _teacher_critique_reject_log_path(self, output: AgentLoopOutput) -> str:
+        configured_path = output.teacher_critique_reject_log_path
+        if configured_path is not None:
+            configured_path = str(configured_path)
+            if configured_path.lower() in {"", "none", "null"}:
+                configured_path = None
+
+        if configured_path is None:
+            trainer_config = self.config.get("trainer", {})
+            default_local_dir = trainer_config.get("default_local_dir", ".") if trainer_config is not None else "."
+            configured_path = os.path.join(str(default_local_dir), "teacher_critique_rejects.txt")
+
+        return os.path.expanduser(os.path.expandvars(configured_path))
+
+    def _format_teacher_critique_reject_record(
+        self,
+        output: AgentLoopOutput,
+        *,
+        critique: str,
+        reject_reason: str,
+        feedback: Any,
+    ) -> str:
+        trajectory_steps = output.extra_fields.get("trajectory_steps", [])
+        try:
+            from verl.experimental.agent_loop.teacher_prompt import format_alfworld_trajectory
+
+            trajectory_text = format_alfworld_trajectory(trajectory_steps) if trajectory_steps else "(empty trajectory)"
+        except Exception:
+            trajectory_text = repr(trajectory_steps)
+
+        parse_errors = ", ".join(getattr(feedback, "parse_errors", ()) or ())
+        if not parse_errors:
+            parse_errors = "(none)"
+
+        return (
+            "\n"
+            + "=" * 100
+            + "\n"
+            + f"timestamp_utc: {datetime.now(timezone.utc).isoformat()}\n"
+            + f"reject_reason: {reject_reason}\n"
+            + f"teacher_confidence: {getattr(feedback, 'confidence', None)}\n"
+            + f"min_confidence: {output.teacher_critique_min_confidence}\n"
+            + f"parse_ok: {getattr(feedback, 'parse_ok', None)}\n"
+            + f"parse_errors: {parse_errors}\n"
+            + f"task_uid: {output.extra_fields.get('task_uid')}\n"
+            + f"trajectory_uid: {output.extra_fields.get('trajectory_uid')}\n"
+            + f"termination_reason: {output.extra_fields.get('termination_reason')}\n"
+            + f"environment_reward: {output.extra_fields.get('environment_reward')}\n"
+            + "\nTeacher output:\n"
+            + critique
+            + "\n\nTrajectory:\n"
+            + trajectory_text
+            + "\n"
+        )
+
+    def _log_teacher_critique_reject(
+        self,
+        output: AgentLoopOutput,
+        *,
+        critique: str,
+        reject_reason: str,
+        feedback: Any,
+    ) -> None:
+        log_path = self._teacher_critique_reject_log_path(output)
+        try:
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            record = self._format_teacher_critique_reject_record(
+                output,
+                critique=critique,
+                reject_reason=reject_reason,
+                feedback=feedback,
+            )
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(record)
+        except OSError as exc:
+            logger.warning("Failed to write teacher critique reject log to %s: %s", log_path, exc)
+
     async def _compute_teacher_logprobs(
         self,
         output: AgentLoopOutput,
@@ -966,32 +1078,20 @@ class AgentLoopWorker:
             if not output.opd_eligible:
                 # Successful trajectories remain available for reward metrics but contribute
                 # no OPD tokens and do not consume either teacher generation or scoring.
-                output.response_mask = [0] * len(output.response_ids)
-                if getattr(self.teacher_server_manager, "uses_full_vocab", False):
-                    teacher_response_indices, teacher_full_logprobs = (
-                        self.teacher_server_manager.empty_teacher_full_vocab_outputs(
-                            vocab_size=len(self.tokenizer),
-                        )
-                    )
-                    output.extra_fields["opd_selected"] = False
-                    output.extra_fields["teacher_response_indices"] = teacher_response_indices
-                    output.extra_fields["teacher_full_logprobs"] = teacher_full_logprobs
-                    return
-                teacher_ids, teacher_logprobs = self.teacher_server_manager.empty_teacher_outputs(
-                    sequence_length=len(prompt_ids) + len(output.response_ids),
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-                output.extra_fields["opd_selected"] = False
-                output.extra_fields["teacher_ids"] = teacher_ids
-                output.extra_fields["teacher_logprobs"] = teacher_logprobs
+                self._exclude_from_opd_training(output, prompt_ids, "not_opd_eligible")
                 return
 
             if output.teacher_prompt_template is None or output.response_step_end_indices is None:
                 raise ValueError(
                     "Critique-conditioned OPD requires teacher_prompt_template and response_step_end_indices."
                 )
-            if output.teacher_prompt_template.count("{critique}") != 1:
-                raise ValueError("teacher_prompt_template must contain exactly one {critique} placeholder.")
+            required_feedback_fields = ("error_step", "reason", "better_decision", "confidence")
+            for field_name in required_feedback_fields:
+                placeholder = "{" + field_name + "}"
+                if output.teacher_prompt_template.count(placeholder) != 1:
+                    raise ValueError(
+                        f"teacher_prompt_template must contain exactly one {placeholder} placeholder."
+                    )
             if not output.response_step_end_indices:
                 raise ValueError("Critique-conditioned OPD requires at least one student action step.")
 
@@ -1002,13 +1102,44 @@ class AgentLoopWorker:
             )
             critique = self.tokenizer.decode(critique_ids, skip_special_tokens=True).strip()
 
-            from verl.experimental.agent_loop.teacher_prompt import parse_critique_error_step
+            from verl.experimental.agent_loop.teacher_prompt import parse_critique_feedback
 
-            error_step = parse_critique_error_step(
+            feedback = parse_critique_feedback(
                 critique,
                 num_steps=len(output.response_step_end_indices),
                 fallback_step=output.fallback_error_step,
             )
+
+            output.extra_fields.update(
+                {
+                    "teacher_critique": critique,
+                    "teacher_feedback_reason": feedback.reason,
+                    "teacher_feedback_better_decision": feedback.better_decision,
+                    "teacher_feedback_confidence": feedback.confidence,
+                    "teacher_critique_parse_ok": feedback.parse_ok,
+                    "teacher_critique_parse_errors": list(feedback.parse_errors),
+                }
+            )
+            if not feedback.parse_ok:
+                self._log_teacher_critique_reject(
+                    output,
+                    critique=critique,
+                    reject_reason="teacher_critique_parse_failed",
+                    feedback=feedback,
+                )
+                self._exclude_from_opd_training(output, prompt_ids, "teacher_critique_parse_failed")
+                return
+            if feedback.confidence < output.teacher_critique_min_confidence:
+                self._log_teacher_critique_reject(
+                    output,
+                    critique=critique,
+                    reject_reason="teacher_critique_low_confidence",
+                    feedback=feedback,
+                )
+                self._exclude_from_opd_training(output, prompt_ids, "teacher_critique_low_confidence")
+                return
+
+            error_step = feedback.error_step
             response_cutoff = output.response_step_end_indices[error_step]
             if response_cutoff <= 0 or response_cutoff > len(output.response_ids):
                 raise ValueError(
@@ -1022,7 +1153,12 @@ class AgentLoopWorker:
                 output.response_logprobs = output.response_logprobs[:response_cutoff]
             response_ids = output.response_ids
 
-            scoring_prompt = output.teacher_prompt_template.replace("{critique}", critique)
+            scoring_prompt = output.teacher_prompt_template.format(
+                error_step=error_step + 1,
+                reason=feedback.reason,
+                better_decision=feedback.better_decision,
+                confidence=f"{feedback.confidence:.3f}",
+            )
             apply_chat_template_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}) or {})
             tokenized_teacher_prompt = apply_chat_template(
                 self.tokenizer,
@@ -1035,7 +1171,6 @@ class AgentLoopWorker:
             output.extra_fields.update(
                 {
                     "opd_selected": True,
-                    "teacher_critique": critique,
                     "opd_error_step": error_step,
                     "opd_response_cutoff": response_cutoff,
                     "opd_original_response_length": original_response_length,
