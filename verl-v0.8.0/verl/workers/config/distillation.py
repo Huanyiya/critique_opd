@@ -165,7 +165,11 @@ class DistillationTeacherModelConfig(BaseConfig):
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
     def validate_and_prepare_for_distillation(
-        self, use_topk: bool, topk: Optional[int], use_full_vocab: bool = False
+        self,
+        use_topk: bool,
+        topk: Optional[int],
+        use_full_vocab: bool = False,
+        use_dense_prompt_logprobs: bool = False,
     ) -> None:
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
@@ -180,12 +184,21 @@ class DistillationTeacherModelConfig(BaseConfig):
             )
         self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
         self.inference.response_length = 1
-        self._validate_teacher_logprobs(use_topk=use_topk, topk=topk, use_full_vocab=use_full_vocab)
+        self._validate_teacher_logprobs(
+            use_topk=use_topk,
+            topk=topk,
+            use_full_vocab=use_full_vocab,
+            use_dense_prompt_logprobs=use_dense_prompt_logprobs,
+        )
 
     def _validate_teacher_logprobs(
-        self, use_topk: bool, topk: Optional[int], use_full_vocab: bool = False
+        self,
+        use_topk: bool,
+        topk: Optional[int],
+        use_full_vocab: bool = False,
+        use_dense_prompt_logprobs: bool = False,
     ) -> None:
-        if not use_topk and not use_full_vocab:
+        if not use_topk and not use_full_vocab and not use_dense_prompt_logprobs:
             return
         if use_topk and use_full_vocab:
             raise ValueError("Teacher log-prob output cannot be both top-k and selected-token OPD.")
@@ -200,6 +213,22 @@ class DistillationTeacherModelConfig(BaseConfig):
             # dense full-vocabulary distribution.  It requests prompt_logprobs=0
             # and keeps only the logprob of the original student-selected token.
             return
+        if use_dense_prompt_logprobs:
+            match engine_name:
+                case "vllm":
+                    vllm_engine_kwargs = dict(engine_kwargs.get("vllm", {}))
+                    vllm_engine_kwargs["max_logprobs"] = -1
+                    engine_kwargs["vllm"] = vllm_engine_kwargs
+                    return
+                case "sglang":
+                    raise NotImplementedError(
+                        "reverse_kl_topk with student-selected support requires dense prompt logprobs; "
+                        "only the vLLM teacher server path currently supports prompt_logprobs=-1."
+                    )
+                case _:
+                    raise NotImplementedError(
+                        f"DistillationTeacherModelConfig does not support inference engine {engine_name}"
+                    )
 
         assert topk is not None
         match engine_name:
@@ -228,7 +257,12 @@ class DistillationTeacherModelConfig(BaseConfig):
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
         """Backward-compatible wrapper for the native top-k validation helper."""
-        self._validate_teacher_logprobs(use_topk=use_topk, topk=topk, use_full_vocab=False)
+        self._validate_teacher_logprobs(
+            use_topk=use_topk,
+            topk=topk,
+            use_full_vocab=False,
+            use_dense_prompt_logprobs=False,
+        )
 
 
 @dataclass
@@ -290,6 +324,7 @@ class DistillationConfig(BaseConfig):
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
                 use_full_vocab=self.distillation_loss.loss_settings.use_full_vocab,
+                use_dense_prompt_logprobs=self.distillation_loss.loss_mode == "reverse_kl_topk",
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

@@ -208,82 +208,206 @@ def compute_forward_kl_topk(
 
 def compute_reverse_kl_topk(
     student_logits: torch.Tensor,
-    teacher_topk_log_probs: torch.Tensor,
-    teacher_topk_ids: torch.Tensor,
+    teacher_full_log_probs: torch.Tensor,
+    teacher_response_indices: torch.Tensor,
+    data: TensorDict,
     config: DistillationConfig,
     data_format: str,
-    unprivileged_teacher_topk_log_probs: torch.Tensor | None = None,
-    unprivileged_teacher_topk_ids: torch.Tensor | None = None,
+    unprivileged_teacher_full_log_probs: torch.Tensor | None = None,
+    unprivileged_teacher_response_indices: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute reverse KL for privileged and unprivileged teacher top-k supports.
+    """Compute reverse KL on the current student's top-k support.
 
     The privileged loss is returned as ``distillation_losses`` and drives the
     update. When the unprivileged current-prompt teacher tensors are present, a
     second reverse KL is returned under ``unprivileged_*`` keys for comparison.
-    Student and teacher are normalized separately on each teacher top-k support.
+
+    The top-k IDs are selected from the current student logits during this actor
+    forward.  Teacher scoring happens earlier in the rollout pipeline, so the
+    teacher provides dense response-position log probabilities and this loss
+    gathers the teacher probabilities at the student-selected IDs.
     """
     del data_format
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    if get_ulysses_sequence_parallel_world_size() != 1:
+        raise NotImplementedError(
+            "reverse_kl_topk with student-selected support does not yet support Ulysses sequence parallelism; "
+            "set actor_rollout_ref.actor.ulysses_sequence_parallel_size=1."
+        )
+    if student_logits.shape[0] != 1:
+        raise ValueError(f"Expected flattened FSDP logits with batch dimension 1, got {student_logits.shape}.")
+
+    student_logits_flat = student_logits.squeeze(0)
+    input_offsets = data["input_ids"].offsets()
+    prompt_lengths = _prompt_lengths(data).to(device=input_offsets.device, dtype=torch.int64)
     loss_config: DistillationLossConfig = config.distillation_loss
+    topk = int(loss_config.topk)
+    if topk <= 0:
+        raise ValueError(f"reverse_kl_topk requires a positive topk value, got {loss_config.topk}.")
+    if topk > student_logits_flat.shape[-1]:
+        raise ValueError(f"topk={topk} exceeds vocabulary size {student_logits_flat.shape[-1]}.")
 
-    def _compute_on_teacher_support(
-        topk_log_probs: torch.Tensor, topk_ids: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        if not topk_log_probs.is_nested or not topk_ids.is_nested:
-            raise ValueError("Top-k teacher log probabilities and token ids must be nested tensors.")
-        topk_log_probs = topk_log_probs.values().unsqueeze(0).float()
-        topk_ids = topk_ids.values().unsqueeze(0).to(dtype=torch.int64)
-        if get_ulysses_sequence_parallel_world_size() > 1:
-            topk_log_probs = slice_input_tensor(topk_log_probs, dim=1)
-            topk_ids = slice_input_tensor(topk_ids, dim=1)
-        if topk_log_probs.shape != topk_ids.shape or topk_log_probs.shape[:2] != student_logits.shape[:2]:
-            raise ValueError(
-                "Teacher top-k tensors must align with student sequence logits, got "
-                f"logprobs={topk_log_probs.shape}, ids={topk_ids.shape}, student={student_logits.shape}."
-            )
-
-        student_topk_ids = torch.topk(student_log_probs, k=topk_ids.shape[-1], dim=-1).indices
-        student_log_probs_on_teacher_topk = torch.gather(
-            student_log_probs, dim=-1, index=topk_ids
-        ).float()
-        student_mass = student_log_probs_on_teacher_topk.exp().sum(dim=-1)
-        teacher_mass = topk_log_probs.exp().sum(dim=-1)
-
-        if loss_config.log_prob_min_clamp is not None:
-            student_log_probs_on_teacher_topk = student_log_probs_on_teacher_topk.clamp_min(
-                loss_config.log_prob_min_clamp
-            )
-            topk_log_probs = topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-
-        student_log_probs_on_teacher_topk = student_log_probs_on_teacher_topk - torch.logsumexp(
-            student_log_probs_on_teacher_topk, dim=-1, keepdim=True
-        )
-        topk_log_probs = topk_log_probs - torch.logsumexp(topk_log_probs, dim=-1, keepdim=True)
-        student_probs_on_teacher_topk = student_log_probs_on_teacher_topk.exp()
-        token_reverse_kl = student_probs_on_teacher_topk * (
-            student_log_probs_on_teacher_topk - topk_log_probs
-        )
-        overlap_mask = (topk_ids.unsqueeze(-1) == student_topk_ids.unsqueeze(-2)).any(dim=-1)
-        overlap_count = overlap_mask.sum(dim=-1)
-        overlap_token_advantage_sum = (-token_reverse_kl * overlap_mask).sum(dim=-1)
-        overlap_token_advantage = overlap_token_advantage_sum / overlap_count.clamp_min(1)
-        overlap_token_advantage = torch.where(
-            overlap_count > 0, overlap_token_advantage, torch.zeros_like(overlap_token_advantage)
-        )
+    def _empty_outputs() -> dict[str, torch.Tensor]:
+        zero = (student_logits_flat.sum(dim=-1) * 0.0).unsqueeze(0)
         return {
-            "distillation_losses": token_reverse_kl.sum(dim=-1),
-            "student_mass": student_mass,
-            "teacher_mass": teacher_mass,
-            "overlap_count": overlap_count,
-            "overlap_token_advantage": overlap_token_advantage,
+            "distillation_losses": zero,
+            "student_mass": zero.detach().clone(),
+            "teacher_mass": zero.detach().clone(),
+            "overlap_count": zero.detach().clone(),
+            "overlap_token_advantage": zero.detach().clone(),
         }
 
-    outputs = _compute_on_teacher_support(teacher_topk_log_probs, teacher_topk_ids)
-    if (unprivileged_teacher_topk_log_probs is None) != (unprivileged_teacher_topk_ids is None):
-        raise ValueError("Unprivileged teacher top-k log probabilities and ids must be provided together.")
-    if unprivileged_teacher_topk_log_probs is not None and unprivileged_teacher_topk_ids is not None:
-        unprivileged_outputs = _compute_on_teacher_support(
-            unprivileged_teacher_topk_log_probs, unprivileged_teacher_topk_ids
+    def _collect_teacher_rows(
+        full_log_probs: torch.Tensor,
+        response_indices: torch.Tensor,
+        *,
+        expected_response_indices: list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, list[torch.Tensor]]:
+        if not full_log_probs.is_nested or not response_indices.is_nested:
+            raise ValueError("Dense teacher log probabilities and response indices must be nested tensors.")
+        teacher_rows = full_log_probs.unbind()
+        index_rows = response_indices.unbind()
+        if not (len(teacher_rows) == len(index_rows) == prompt_lengths.numel()):
+            raise ValueError(
+                "Teacher dense-logprob batch size must match the student batch: "
+                f"rows={len(teacher_rows)}, indices={len(index_rows)}, batch={prompt_lengths.numel()}."
+            )
+
+        predictor_positions: list[torch.Tensor] = []
+        selected_teacher_rows: list[torch.Tensor] = []
+        collected_indices: list[torch.Tensor] = []
+        for sample_idx, (sample_teacher, sample_indices) in enumerate(zip(teacher_rows, index_rows, strict=True)):
+            if sample_teacher.shape[0] != sample_indices.numel():
+                raise ValueError(
+                    f"Sample {sample_idx} has {sample_teacher.shape[0]} teacher rows but "
+                    f"{sample_indices.numel()} response indices."
+                )
+            if sample_teacher.dim() != 2 or sample_teacher.shape[-1] != student_logits_flat.shape[-1]:
+                raise ValueError(
+                    "Teacher dense log probabilities must have shape [num_selected_tokens, vocab], "
+                    f"got {sample_teacher.shape} for sample {sample_idx}, "
+                    f"student vocab={student_logits_flat.shape[-1]}."
+                )
+            sample_indices_device = sample_indices.to(device=input_offsets.device, dtype=torch.int64)
+            if expected_response_indices is not None:
+                expected = expected_response_indices[sample_idx].to(device=input_offsets.device, dtype=torch.int64)
+                if sample_indices_device.shape != expected.shape or not torch.equal(sample_indices_device, expected):
+                    raise ValueError(
+                        "Privileged and unprivileged teacher rows must score the same response-local positions; "
+                        f"sample {sample_idx} got {sample_indices_device.tolist()} vs expected {expected.tolist()}."
+                    )
+            collected_indices.append(sample_indices.detach().cpu())
+            if sample_indices.numel() == 0:
+                continue
+
+            response_length = input_offsets[sample_idx + 1] - input_offsets[sample_idx] - prompt_lengths[sample_idx]
+            if bool(((sample_indices_device < 0) | (sample_indices_device >= response_length)).any()):
+                raise ValueError(
+                    f"Sample {sample_idx} contains response indices outside [0, {response_length.item()}): "
+                    f"{sample_indices.tolist()}."
+                )
+
+            predictor_positions.append(
+                input_offsets[sample_idx] + prompt_lengths[sample_idx] - 1 + sample_indices_device
+            )
+            selected_teacher_rows.append(sample_teacher)
+
+        if not predictor_positions:
+            return None, None, collected_indices
+        return (
+            torch.cat(predictor_positions).to(device=student_logits_flat.device, dtype=torch.int64),
+            torch.cat(selected_teacher_rows, dim=0).to(device=student_logits_flat.device).float(),
+            collected_indices,
+        )
+
+    def _compute_on_student_support(
+        full_log_probs: torch.Tensor,
+        response_indices: torch.Tensor,
+        *,
+        expected_response_indices: list[torch.Tensor] | None = None,
+        cached_support: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
+        predictor_positions, selected_teacher_full_log_probs, collected_indices = _collect_teacher_rows(
+            full_log_probs,
+            response_indices,
+            expected_response_indices=expected_response_indices,
+        )
+        if predictor_positions is None or selected_teacher_full_log_probs is None:
+            return _empty_outputs(), collected_indices, None
+
+        if cached_support is None:
+            selected_student_log_probs = F.log_softmax(
+                student_logits_flat.index_select(0, predictor_positions).float(),
+                dim=-1,
+            )
+            student_topk_log_probs, student_topk_ids = torch.topk(selected_student_log_probs, k=topk, dim=-1)
+            support = (
+                predictor_positions,
+                student_topk_log_probs,
+                student_topk_ids,
+            )
+        else:
+            predictor_positions, student_topk_log_probs, student_topk_ids = cached_support
+            support = cached_support
+
+        teacher_log_probs_on_student_topk = torch.gather(
+            selected_teacher_full_log_probs,
+            dim=-1,
+            index=student_topk_ids,
+        )
+        student_mass = student_topk_log_probs.exp().sum(dim=-1)
+        teacher_mass = teacher_log_probs_on_student_topk.exp().sum(dim=-1)
+
+        if loss_config.log_prob_min_clamp is not None:
+            student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+            teacher_log_probs_on_student_topk = teacher_log_probs_on_student_topk.clamp_min(
+                loss_config.log_prob_min_clamp
+            )
+
+        student_topk_log_probs = student_topk_log_probs - torch.logsumexp(
+            student_topk_log_probs, dim=-1, keepdim=True
+        )
+        teacher_log_probs_on_student_topk = teacher_log_probs_on_student_topk - torch.logsumexp(
+            teacher_log_probs_on_student_topk, dim=-1, keepdim=True
+        )
+        student_topk_probs = student_topk_log_probs.exp()
+        token_reverse_kl = student_topk_probs * (student_topk_log_probs - teacher_log_probs_on_student_topk)
+        selected_losses = token_reverse_kl.sum(dim=-1)
+
+        token_losses = student_logits_flat.sum(dim=-1) * 0.0
+        token_losses = token_losses.index_copy(0, predictor_positions, selected_losses)
+        student_mass_out = torch.zeros_like(token_losses).index_copy(0, predictor_positions, student_mass)
+        teacher_mass_out = torch.zeros_like(token_losses).index_copy(0, predictor_positions, teacher_mass)
+        overlap_count_out = torch.zeros_like(token_losses).index_copy(
+            0,
+            predictor_positions,
+            torch.full_like(selected_losses, float(topk)),
+        )
+        overlap_token_advantage = (-token_reverse_kl).mean(dim=-1)
+        overlap_token_advantage_out = torch.zeros_like(token_losses).index_copy(
+            0,
+            predictor_positions,
+            overlap_token_advantage,
+        )
+        return {
+            "distillation_losses": token_losses.unsqueeze(0),
+            "student_mass": student_mass_out.unsqueeze(0),
+            "teacher_mass": teacher_mass_out.unsqueeze(0),
+            "overlap_count": overlap_count_out.unsqueeze(0),
+            "overlap_token_advantage": overlap_token_advantage_out.unsqueeze(0),
+        }, collected_indices, support
+
+    outputs, expected_indices, cached_support = _compute_on_student_support(
+        teacher_full_log_probs,
+        teacher_response_indices,
+    )
+    if (unprivileged_teacher_full_log_probs is None) != (unprivileged_teacher_response_indices is None):
+        raise ValueError("Unprivileged teacher dense log probabilities and response indices must be provided together.")
+    if unprivileged_teacher_full_log_probs is not None and unprivileged_teacher_response_indices is not None:
+        unprivileged_outputs, _, _ = _compute_on_student_support(
+            unprivileged_teacher_full_log_probs,
+            unprivileged_teacher_response_indices,
+            expected_response_indices=expected_indices,
+            cached_support=cached_support,
         )
         outputs.update({f"unprivileged_{key}": value.detach() for key, value in unprivileged_outputs.items()})
     return outputs

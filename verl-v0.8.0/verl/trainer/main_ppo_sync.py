@@ -389,14 +389,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
-        # TODO: Support output:list[AgentLoopOutput]
-        await self._compute_teacher_logprobs(
+        expanded_outputs = await self._compute_teacher_logprobs(
             final_output,
             prompt_ids=final_output.prompt_ids,
             response_ids=final_output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
         )
+        if expanded_outputs is not None:
+            outputs = expanded_outputs if isinstance(expanded_outputs, list) else [expanded_outputs]
 
         if final_output.reward_score is not None:
             for output in outputs[:-1]:

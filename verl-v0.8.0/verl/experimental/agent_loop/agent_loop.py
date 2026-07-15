@@ -190,6 +190,10 @@ class AgentLoopOutput(BaseModel):
             output["extra_fields"].pop("teacher_response_indices", None),
             output["extra_fields"].pop("teacher_full_logprobs", None),
         )
+        unprivileged_teacher_response_indices, unprivileged_teacher_full_logprobs = (
+            output["extra_fields"].pop("unprivileged_teacher_response_indices", None),
+            output["extra_fields"].pop("unprivileged_teacher_full_logprobs", None),
+        )
         if teacher_ids is not None:
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
@@ -202,6 +206,10 @@ class AgentLoopOutput(BaseModel):
             output["teacher_response_indices"] = teacher_response_indices
         if teacher_full_logprobs is not None:
             output["teacher_full_logprobs"] = teacher_full_logprobs
+        if unprivileged_teacher_response_indices is not None:
+            output["unprivileged_teacher_response_indices"] = unprivileged_teacher_response_indices
+        if unprivileged_teacher_full_logprobs is not None:
+            output["unprivileged_teacher_full_logprobs"] = unprivileged_teacher_full_logprobs
         return output
 
 
@@ -236,6 +244,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Response-local positions with full-vocabulary teacher distributions."""
     teacher_full_logprobs: Optional[torch.Tensor] = None
     """Full-vocabulary teacher log probabilities for selected response positions."""
+    unprivileged_teacher_response_indices: Optional[torch.Tensor] = None
+    """Response-local positions with unprivileged full-vocabulary teacher distributions."""
+    unprivileged_teacher_full_logprobs: Optional[torch.Tensor] = None
+    """Unprivileged full-vocabulary teacher log probabilities for selected response positions."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -784,6 +796,10 @@ class AgentLoopWorker:
             output.extra_fields.pop("teacher_response_indices", None),
             output.extra_fields.pop("teacher_full_logprobs", None),
         )
+        unprivileged_teacher_response_indices, unprivileged_teacher_full_logprobs = (
+            output.extra_fields.pop("unprivileged_teacher_response_indices", None),
+            output.extra_fields.pop("unprivileged_teacher_full_logprobs", None),
+        )
         if teacher_ids is not None and teacher_logprobs is not None:
             from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
 
@@ -827,6 +843,8 @@ class AgentLoopWorker:
             unprivileged_teacher_ids=unprivileged_teacher_ids,
             teacher_response_indices=teacher_response_indices,
             teacher_full_logprobs=teacher_full_logprobs,
+            unprivileged_teacher_response_indices=unprivileged_teacher_response_indices,
+            unprivileged_teacher_full_logprobs=unprivileged_teacher_full_logprobs,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -952,6 +970,10 @@ class AgentLoopWorker:
             output.extra_fields.pop("teacher_response_indices", None),
             output.extra_fields.pop("teacher_full_logprobs", None),
         )
+        unprivileged_teacher_response_indices, unprivileged_teacher_full_logprobs = (
+            output.extra_fields.pop("unprivileged_teacher_response_indices", None),
+            output.extra_fields.pop("unprivileged_teacher_full_logprobs", None),
+        )
         if teacher_ids is not None and teacher_logprobs is not None:
             # TODO(wuxibin): remove padding and use tensordict.
             from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
@@ -996,6 +1018,8 @@ class AgentLoopWorker:
             unprivileged_teacher_ids=unprivileged_teacher_ids,
             teacher_response_indices=teacher_response_indices,
             teacher_full_logprobs=teacher_full_logprobs,
+            unprivileged_teacher_response_indices=unprivileged_teacher_response_indices,
+            unprivileged_teacher_full_logprobs=unprivileged_teacher_full_logprobs,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -1143,6 +1167,18 @@ class AgentLoopWorker:
 
     def _populate_empty_teacher_outputs(self, output: AgentLoopOutput, prompt_ids: list[int]) -> None:
         """Attach shape-compatible empty teacher outputs for trajectories excluded from OPD."""
+        if getattr(self.teacher_server_manager, "uses_student_topk_support", False):
+            teacher_response_indices, teacher_full_logprobs = (
+                self.teacher_server_manager.empty_teacher_response_full_vocab_outputs(
+                    vocab_size=len(self.tokenizer),
+                )
+            )
+            output.extra_fields["teacher_response_indices"] = teacher_response_indices
+            output.extra_fields["teacher_full_logprobs"] = teacher_full_logprobs
+            output.extra_fields["unprivileged_teacher_response_indices"] = teacher_response_indices.clone()
+            output.extra_fields["unprivileged_teacher_full_logprobs"] = teacher_full_logprobs.clone()
+            return
+
         if getattr(self.teacher_server_manager, "uses_full_vocab", False):
             teacher_response_indices, teacher_full_logprobs = (
                 self.teacher_server_manager.empty_teacher_full_vocab_outputs(
@@ -1319,6 +1355,8 @@ class AgentLoopWorker:
                 "unprivileged_teacher_logprobs",
                 "teacher_response_indices",
                 "teacher_full_logprobs",
+                "unprivileged_teacher_response_indices",
+                "unprivileged_teacher_full_logprobs",
             ):
                 child.extra_fields.pop(field_name, None)
             child.extra_fields.update(
@@ -1496,6 +1534,36 @@ class AgentLoopWorker:
             )
 
         teacher_prompt_ids = output.teacher_prompt_ids if output.teacher_prompt_ids is not None else prompt_ids
+        if getattr(self.teacher_server_manager, "uses_student_topk_support", False):
+            teacher_response_indices, teacher_full_logprobs = (
+                await self.teacher_server_manager.compute_teacher_response_full_vocab_logprobs_single(
+                    sequence_ids=teacher_prompt_ids + response_ids,
+                    teacher_prompt_length=len(teacher_prompt_ids),
+                    response_mask=output.response_mask,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    routing_key=routing_key,
+                )
+            )
+            output.extra_fields["teacher_response_indices"] = teacher_response_indices
+            output.extra_fields["teacher_full_logprobs"] = teacher_full_logprobs
+
+            if output.extra_fields.get("opd_selected", False):
+                unprivileged_teacher_response_indices, unprivileged_teacher_full_logprobs = (
+                    await self.teacher_server_manager.compute_teacher_response_full_vocab_logprobs_single(
+                        sequence_ids=prompt_ids + response_ids,
+                        teacher_prompt_length=len(prompt_ids),
+                        response_mask=output.response_mask,
+                        multi_modal_data=output.multi_modal_data,
+                        mm_processor_kwargs=output.mm_processor_kwargs,
+                        routing_key=routing_key,
+                    )
+                )
+                output.extra_fields["unprivileged_teacher_response_indices"] = unprivileged_teacher_response_indices
+                output.extra_fields["unprivileged_teacher_full_logprobs"] = unprivileged_teacher_full_logprobs
+                output.extra_fields["unprivileged_teacher_prompt_matches_student"] = True
+            return None
+
         if getattr(self.teacher_server_manager, "uses_full_vocab", False):
             teacher_response_indices, teacher_full_logprobs = (
                 await self.teacher_server_manager.compute_teacher_full_vocab_logprobs_single(
@@ -1590,6 +1658,16 @@ class AgentLoopWorker:
             )
             optional_outputs["teacher_response_indices"] = torch.nested.as_nested_tensor(
                 [input.teacher_response_indices for input in inputs], layout=torch.jagged
+            )
+        if (
+            inputs[0].unprivileged_teacher_full_logprobs is not None
+            and inputs[0].unprivileged_teacher_response_indices is not None
+        ):
+            optional_outputs["unprivileged_teacher_full_logprobs"] = torch.nested.as_nested_tensor(
+                [input.unprivileged_teacher_full_logprobs for input in inputs], layout=torch.jagged
+            )
+            optional_outputs["unprivileged_teacher_response_indices"] = torch.nested.as_nested_tensor(
+                [input.unprivileged_teacher_response_indices for input in inputs], layout=torch.jagged
             )
         batch = TensorDict(
             {

@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 
 STUDENT_MODEL_PATH=${STUDENT_MODEL_PATH:-/mnt/cpfs/weights/Qwen3.5-4B}
-TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/mnt/cpfs/weights/Qwen-7B}
+TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/mnt/cpfs/weights/Qwen3.5-9B}
 
 DATA_DIR=${DATA_DIR:-${HOME}/data/alfworld_opd}
 export ALFWORLD_DATA=${ALFWORLD_DATA:-/mnt/cpfs/datasets/alfworld}

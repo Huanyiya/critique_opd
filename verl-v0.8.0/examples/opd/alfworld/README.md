@@ -12,11 +12,12 @@ trajectory, the same teacher worker performs two operations:
    prompt augmented with `c`, and once under the exact original student current
    prompt without `c`. The response is never decoded and re-tokenized.
 
-The `reverse_kl_topk` loss uses the teacher's top 16 token IDs at each response
-position. It gathers the student's probabilities at those same IDs and computes
-`sum p_student * (log p_student - log p_teacher)` after separately normalizing
-the student and teacher distributions on that support. This is a distributional
-top-k loss, not the sampled-token `kl` estimator.
+The `reverse_kl_topk` loss first selects the current student's top 16 token IDs
+at each response position. It then gathers the teacher probabilities at those
+same IDs and computes `sum p_student * (log p_student - log p_teacher)` after
+separately normalizing the student and teacher distributions on the
+student-selected support. This is a distributional top-k loss, not the
+sampled-token `kl` estimator.
 The privileged reverse KL drives the student update. The unprivileged reverse
 KL is computed in the same forward pass as a control and is logged as
 `distillation/unprivileged_reverse_kl`; it is not added to the training loss.
@@ -31,11 +32,12 @@ teacher-identified erroneous action. Later actions are not included in OPD.
 If a training batch contains no failed-trajectory tokens, the actor optimizer
 step is skipped entirely.
 
-The teacher server requests `prompt_logprobs=16`; the generated dummy token is
-discarded and never enters the trajectory. Successful trajectories and tokens
-after the identified error cutoff remain excluded by `response_mask`. The
-launcher uses eager FSDP logits because the fused top-k kernel implements the
-native forward-KL path rather than this reverse-KL loss.
+The teacher server requests dense prompt log-probability rows for the trainable
+response positions; the generated dummy token is discarded and never enters the
+trajectory. Successful trajectories and tokens after the identified error cutoff
+remain excluded by `response_mask`. The launcher uses eager FSDP logits because
+the fused top-k kernel implements the native forward-KL path rather than this
+reverse-KL loss.
 
 ## Setup
 

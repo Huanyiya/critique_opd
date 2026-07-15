@@ -162,10 +162,11 @@ def compute_topk_loss(
             if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk":
                 outputs = fsdp_losses.compute_reverse_kl_topk(
                     student_logits=student_logits,
-                    teacher_topk_log_probs=data["teacher_logprobs"],
-                    teacher_topk_ids=data["teacher_ids"],
-                    unprivileged_teacher_topk_log_probs=data.get("unprivileged_teacher_logprobs"),
-                    unprivileged_teacher_topk_ids=data.get("unprivileged_teacher_ids"),
+                    teacher_full_log_probs=data["teacher_full_logprobs"],
+                    teacher_response_indices=data["teacher_response_indices"],
+                    unprivileged_teacher_full_log_probs=data.get("unprivileged_teacher_full_logprobs"),
+                    unprivileged_teacher_response_indices=data.get("unprivileged_teacher_response_indices"),
+                    data=data,
                     config=distillation_config,
                     data_format=data_format,
                 )
