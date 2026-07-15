@@ -10,8 +10,9 @@ TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/mnt/cpfs/weights/Qwen-7B}
 DATA_DIR=${DATA_DIR:-${HOME}/data/alfworld_opd}
 export ALFWORLD_DATA=${ALFWORLD_DATA:-/mnt/cpfs/datasets/alfworld}
 OUTPUT_DIR=${OUTPUT_DIR:-${ROOT_DIR}/checkpoints/alfworld_opd}
-TRAIN_TASKS=${TRAIN_TASKS:-32}
-VAL_TASKS=${VAL_TASKS:-128}
+TRAIN_DATA_SIZE=${TRAIN_DATA_SIZE:-16}
+VAL_DATA_SIZE=${VAL_DATA_SIZE:-128}
+GROUP_SIZE=${GROUP_SIZE:-8}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-160}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
@@ -22,7 +23,7 @@ TEACHER_GPUS_PER_NODE=${TEACHER_GPUS_PER_NODE:-4}
 NNODES=${NNODES:-1}
 STUDENT_TP=${STUDENT_TP:-1}
 TEACHER_TP=${TEACHER_TP:-4}
-AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-32}
+AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-${TRAIN_DATA_SIZE}}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.6}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.8}
 
@@ -40,19 +41,22 @@ export ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS=${ALFWORLD_TEACHER_CRITIQUE_MAX_TOKE
 export ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE=${ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE:-0.1}
 export ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH=${ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH:-"${OUTPUT_DIR}/teacher_critique_rejects.txt"}
 
-python3 "${ROOT_DIR}/examples/opd/alfworld/prepare_data.py" \
-    --output-dir "${DATA_DIR}" \
-    --train-size "${TRAIN_TASKS}" \
-    --val-size "${VAL_TASKS}" \
+PREPARE_DATA_ARGS=(
+    --output-dir "${DATA_DIR}"
+    --train-data-size "${TRAIN_DATA_SIZE}"
+    --val-data-size "${VAL_DATA_SIZE}"
     --eval-split "${ALFWORLD_EVAL_SPLIT:-eval_in_distribution}"
+)
+
+python3 "${ROOT_DIR}/examples/opd/alfworld/prepare_data.py" "${PREPARE_DATA_ARGS[@]}"
 
 python3 -m verl.trainer.main_ppo_sync \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     data.train_files="${DATA_DIR}/train.parquet" \
     data.val_files="${DATA_DIR}/val.parquet" \
-    data.train_batch_size="${TRAIN_TASKS}" \
-    data.val_batch_size="${VAL_TASKS}" \
+    data.train_batch_size="${TRAIN_DATA_SIZE}" \
+    data.val_batch_size="${VAL_DATA_SIZE}" \
     data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
     data.max_response_length="${MAX_RESPONSE_LENGTH}" \
     data.filter_overlong_prompts=False \
@@ -64,14 +68,14 @@ python3 -m verl.trainer.main_ppo_sync \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
-    actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_TASKS}" \
+    actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_DATA_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.use_torch_compile=False \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.n=1 \
+    actor_rollout_ref.rollout.n="${GROUP_SIZE}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${STUDENT_TP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \

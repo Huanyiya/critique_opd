@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -39,6 +41,21 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 ACTION_PATTERN = re.compile(r"<action>\s*(.*?)\s*</action>", flags=re.IGNORECASE | re.DOTALL)
 CHINESE_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 TASK_MARKER = "Your task is to: "
+ALFWORLD_TASK_TYPES = {
+    1: "pick_and_place_simple",
+    2: "look_at_obj_in_light",
+    3: "pick_clean_then_place_in_recep",
+    4: "pick_heat_then_place_in_recep",
+    5: "pick_cool_then_place_in_recep",
+    6: "pick_two_obj_and_place",
+}
+ALFWORLD_SPLIT_DIRS = {
+    "train": "train",
+    "eval_in_distribution": "valid_seen",
+    "eval_out_of_distribution": "valid_unseen",
+}
+_GAME_POOL_CACHE: dict[tuple[str, str], list[str]] = {}
+_GAME_PERMUTATION_CACHE: dict[tuple[str, str, int], list[str]] = {}
 ALFWORLD_TEMPLATE_NO_HIS = """
 You are an expert agent operating in the ALFRED Embodied Environment.
 Your current observation is: {current_observation}
@@ -178,6 +195,101 @@ def _expand_environment_variables(value: Any) -> Any:
     return value
 
 
+def _resolve_alfworld_data_root(data_root: Optional[str]) -> Path:
+    if data_root is None or str(data_root).lower() in {"", "none", "null"}:
+        data_root = os.environ.get("ALFWORLD_DATA", "~/.cache/alfworld")
+    return Path(os.path.expandvars(os.path.expanduser(str(data_root)))).resolve()
+
+
+def _resolve_alfworld_split_dir(data_root: Optional[str], split: str) -> Path:
+    root = _resolve_alfworld_data_root(data_root)
+    split_dir_name = ALFWORLD_SPLIT_DIRS[split]
+    candidates = (
+        root / "json_2.1.1" / split_dir_name,
+        root / split_dir_name,
+        root,
+    )
+    for candidate in candidates:
+        if candidate.name == split_dir_name and candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find ALFWorld {split!r} directory under {root}. "
+        f"Expected one of: {', '.join(str(candidate) for candidate in candidates)}"
+    )
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+def _collect_alfworld_game_pool(data_root: Optional[str], split: str) -> list[str]:
+    """Collect the full legal, solvable ALFWorld game pool for one split."""
+    split_dir = _resolve_alfworld_split_dir(data_root, split)
+    cache_key = (str(split_dir), split)
+    cached = _GAME_POOL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    allowed_task_types = set(ALFWORLD_TASK_TYPES.values())
+    game_files: list[str] = []
+    for root, dirs, files in os.walk(split_dir):
+        dirs.sort()
+        files.sort()
+        if "traj_data.json" not in files:
+            continue
+
+        task_dir = Path(root)
+        task_dir_text = str(task_dir)
+        if "movable" in task_dir_text or "Sliced" in task_dir_text:
+            continue
+
+        game_file = task_dir / "game.tw-pddl"
+        if not game_file.exists():
+            continue
+
+        traj_data = _read_json_file(task_dir / "traj_data.json")
+        if traj_data.get("task_type") not in allowed_task_types:
+            continue
+
+        game_data = _read_json_file(game_file)
+        if not game_data.get("solvable", False):
+            continue
+
+        game_files.append(str(game_file.resolve()))
+
+    if not game_files:
+        raise ValueError(f"No legal solvable ALFWorld games found for split={split!r} under {split_dir}.")
+
+    _GAME_POOL_CACHE[cache_key] = game_files
+    logger.warning("Loaded %d ALFWorld games for split=%s from %s", len(game_files), split, split_dir)
+    return game_files
+
+
+def _select_alfworld_game_file(
+    *,
+    data_root: Optional[str],
+    split: str,
+    group_seed: int,
+    rollout_step: int,
+) -> str:
+    """Pick the next game from a group-specific shuffled iterator.
+
+    OPID keeps one shuffled game iterator per environment worker. Native veRL's
+    agent-loop instances are short-lived, so we reproduce the same semantics
+    with a cached deterministic permutation indexed by global training step.
+    """
+    pool = _collect_alfworld_game_pool(data_root, split)
+    split_dir = _resolve_alfworld_split_dir(data_root, split)
+    permutation_key = (str(split_dir), split, int(group_seed))
+    permutation = _GAME_PERMUTATION_CACHE.get(permutation_key)
+    if permutation is None:
+        permutation = list(pool)
+        random.Random(int(group_seed)).shuffle(permutation)
+        _GAME_PERMUTATION_CACHE[permutation_key] = permutation
+    return permutation[int(rollout_step) % len(permutation)]
+
+
 class InstalledALFWorldEnvironment:
     """Adapter around the installed ``alfworld`` package's batch-size-one API."""
 
@@ -188,6 +300,7 @@ class InstalledALFWorldEnvironment:
         split: str,
         seed: int,
         num_games: Optional[int] = None,
+        game_file: Optional[str] = None,
     ):
         try:
             import alfworld
@@ -204,11 +317,34 @@ class InstalledALFWorldEnvironment:
 
         config.setdefault("env", {})["type"] = "AlfredTWEnv"
         config.setdefault("general", {})["use_cuda"] = False
-        if num_games is not None:
+
+        game_file_path = None
+        if game_file is not None and str(game_file).lower() not in {"", "none", "null"}:
+            game_file_path = Path(os.path.expandvars(os.path.expanduser(str(game_file)))).resolve()
+            if not game_file_path.is_file():
+                raise FileNotFoundError(f"ALFWorld game file does not exist: {game_file_path}")
+
+            dataset_config = config.setdefault("dataset", {})
+            game_dir = str(game_file_path.parent)
+            if split == "train":
+                dataset_config["data_path"] = game_dir
+            elif split == "eval_in_distribution":
+                dataset_config["eval_id_data_path"] = game_dir
+            elif split == "eval_out_of_distribution":
+                dataset_config["eval_ood_data_path"] = game_dir
+            dataset_config["num_train_games"] = 1
+            dataset_config["num_eval_games"] = 1
+        elif num_games is not None:
             config.setdefault("dataset", {})["num_train_games"] = int(num_games)
             config["dataset"]["num_eval_games"] = int(num_games)
 
         base_env = get_environment("AlfredTWEnv")(config, train_eval=split)
+        if game_file_path is not None:
+            # The official ALFWorld wrapper has already collected games in the
+            # constructor. Keep the row-to-task mapping explicit even if the
+            # package changes its traversal order.
+            base_env.game_files = [str(game_file_path)]
+            base_env.num_games = 1
         self._base_env = base_env
         self._env = base_env.init_env(batch_size=1)
         self._env.seed(seed)
@@ -261,16 +397,33 @@ class InstalledALFWorldEnvironment:
 class InstalledALFWorldEnvironmentFactory:
     """Construct independent ALFWorld instances for concurrent trajectories."""
 
-    def __init__(self, config_path: Optional[str], num_games: Optional[int]):
+    def __init__(self, config_path: Optional[str], num_games: Optional[int], data_root: Optional[str]):
         self.config_path = config_path
         self.num_games = num_games
+        self.data_root = data_root
 
-    def __call__(self, *, split: str, seed: int) -> ALFWorldEnvironment:
+    def __call__(
+        self,
+        *,
+        split: str,
+        seed: int,
+        game_file: Optional[str] = None,
+        group_seed: Optional[int] = None,
+        rollout_step: int = 0,
+    ) -> ALFWorldEnvironment:
+        if game_file is None:
+            game_file = _select_alfworld_game_file(
+                data_root=self.data_root,
+                split=split,
+                group_seed=seed if group_seed is None else group_seed,
+                rollout_step=rollout_step,
+            )
         return InstalledALFWorldEnvironment(
             config_path=self.config_path,
             split=split,
             seed=seed,
             num_games=self.num_games,
+            game_file=game_file,
         )
 
 
@@ -281,6 +434,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
         self,
         *args,
         config_path: Optional[str] = None,
+        data_root: Optional[str] = None,
         train_split: str = "train",
         eval_split: str = "eval_in_distribution",
         seed: int = 0,
@@ -298,6 +452,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
         self.train_split = train_split
         self.eval_split = eval_split
+        self.data_root = data_root
         self.seed = int(seed)
         self.num_games = (
             int(num_games) if num_games is not None and str(num_games).lower() not in {"none", "null", ""} else None
@@ -321,6 +476,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
         self.environment_factory = environment_factory or InstalledALFWorldEnvironmentFactory(
             config_path=config_path,
             num_games=self.num_games,
+            data_root=self.data_root,
         )
         if self.max_steps <= 0:
             raise ValueError(f"max_steps must be positive, got {self.max_steps}.")
@@ -363,8 +519,20 @@ class ALFWorldAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         extra_info = kwargs.get("extra_info", {}) or {}
         sample_index = int(kwargs.get("index", extra_info.get("index", 0)))
+        global_step = int(kwargs.get("global_steps", extra_info.get("global_steps", 0)) or 0)
         split = self._resolve_split(extra_info)
-        environment = self.environment_factory(split=split, seed=self.seed + sample_index)
+        group_seed = self.seed + sample_index
+        try:
+            environment = self.environment_factory(
+                split=split,
+                seed=group_seed,
+                group_seed=group_seed,
+                rollout_step=global_step,
+            )
+        except TypeError as exc:
+            if "group_seed" not in str(exc) and "rollout_step" not in str(exc):
+                raise
+            environment = self.environment_factory(split=split, seed=group_seed)
 
         generate_seconds = 0.0
         num_preempted = 0

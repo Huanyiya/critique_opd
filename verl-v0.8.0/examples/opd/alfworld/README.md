@@ -81,14 +81,30 @@ By default, the actor/student pool uses four GPUs and the separate teacher pool
 uses four GPUs. Override `STUDENT_GPUS_PER_NODE`, `TEACHER_GPUS_PER_NODE`,
 `STUDENT_TP`, and `TEACHER_TP` to match the node and model sizes.
 
+The data preparation step follows OPID's placeholder-data flow. It writes
+`TRAIN_DATA_SIZE` empty-prompt train rows and `VAL_DATA_SIZE` empty-prompt
+validation rows; these rows only let veRL build a DataLoader and do not contain
+real ALFWorld tasks. Real tasks are sampled inside the ALFWorld agent loop from
+the full legal, solvable game pool under `$ALFWORLD_DATA/json_2.1.1`.
+
+By default `TRAIN_DATA_SIZE=16` and `GROUP_SIZE=8`. `data.train_batch_size`
+equals `TRAIN_DATA_SIZE`; `actor_rollout_ref.rollout.n` equals `GROUP_SIZE`.
+Each global step therefore collects `TRAIN_DATA_SIZE × GROUP_SIZE` trajectories.
+The same task group shares one shuffled game iterator and seed, so the 8
+trajectories in that group start from the same ALFWorld task while sampling
+independent student rollouts. Different task groups use different seeds. Since
+the placeholder train set size equals the batch size, one epoch is one training
+step; `trainer.total_epochs` is effectively the total number of training steps.
+
 `MAX_RESPONSE_LENGTH` controls the per-step action width. The launcher defaults
 `ALFWORLD_MAX_ACTION_TOKENS` to the same value, while `ALFWORLD_MAX_STEPS`
 controls the maximum number of environment steps in a trajectory.
 
 ## Two-task smoke test
 
-The smoke launcher restricts the driver datasets and ALFWorld game set to two
-tasks, runs at most two environment steps, and performs one training epoch:
+The smoke launcher sets `TRAIN_DATA_SIZE=2`, `GROUP_SIZE=2`, and
+`VAL_DATA_SIZE=2`, runs at most two environment steps, and performs one training
+epoch:
 
 ```bash
 STUDENT_MODEL_PATH=/models/Qwen3.5-student \
