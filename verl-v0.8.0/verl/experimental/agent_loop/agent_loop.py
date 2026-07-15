@@ -520,6 +520,11 @@ class AgentLoopWorker:
                 self.model_config.processor.chat_template = self.model_config.custom_chat_template
             self.model_config.tokenizer.chat_template = self.model_config.custom_chat_template
 
+        if config.actor_rollout_ref.rollout.agent.default_agent_loop == "alfworld_opd":
+            from verl.experimental.agent_loop.alfworld_agent_loop import initialize_alfworld_env_manager_from_config
+
+            initialize_alfworld_env_manager_from_config(config)
+
         trace_config = self.rollout_config.trace
         RolloutTraceConfig.init(
             self.rollout_config.trace.project_name,

@@ -90,11 +90,15 @@ the full legal, solvable game pool under `$ALFWORLD_DATA/json_2.1.1`.
 By default `TRAIN_DATA_SIZE=16` and `GROUP_SIZE=8`. `data.train_batch_size`
 equals `TRAIN_DATA_SIZE`; `actor_rollout_ref.rollout.n` equals `GROUP_SIZE`.
 Each global step therefore collects `TRAIN_DATA_SIZE × GROUP_SIZE` trajectories.
-The same task group shares one shuffled game iterator and seed, so the 8
-trajectories in that group start from the same ALFWorld task while sampling
-independent student rollouts. Different task groups use different seeds. Since
-the placeholder train set size equals the batch size, one epoch is one training
-step; `trainer.total_epochs` is effectively the total number of training steps.
+At rollout-worker initialization, the ALFWorld loop creates an OPID-style
+persistent Ray environment pool with `TRAIN_DATA_SIZE × GROUP_SIZE` CPU workers
+for training. Each worker calls `base_env.init_env(batch_size=1)` only once and
+is reused across training steps. Worker `i` belongs to group `i // GROUP_SIZE`
+and uses seed `ALFWORLD_SEED + group_id`, so the 8 workers in one group share a
+shuffled game order and reset to the same task while producing independent
+student rollouts. Different groups use different seeds. Since the placeholder
+train set size equals the batch size, one epoch is one training step;
+`trainer.total_epochs` is effectively the total number of training steps.
 
 `MAX_RESPONSE_LENGTH` controls the per-step action width. The launcher defaults
 `ALFWORLD_MAX_ACTION_TOKENS` to the same value, while `ALFWORLD_MAX_STEPS`

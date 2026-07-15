@@ -6,6 +6,8 @@
   eval_split: ${oc.env:ALFWORLD_EVAL_SPLIT,eval_in_distribution}
   seed: ${oc.decode:${oc.env:ALFWORLD_SEED,0}}
   num_games: ${oc.decode:${oc.env:ALFWORLD_NUM_GAMES,null}}
+  env_pool_name: ${oc.env:ALFWORLD_ENV_POOL_NAME,null}
+  env_worker_num_cpus: ${oc.decode:${oc.env:ALFWORLD_ENV_WORKER_NUM_CPUS,0.1}}
   max_steps: ${oc.decode:${oc.env:ALFWORLD_MAX_STEPS,30}}
   history_length: ${oc.decode:${oc.env:ALFWORLD_HISTORY_LENGTH,5}}
   max_action_tokens: ${oc.decode:${oc.env:ALFWORLD_MAX_ACTION_TOKENS,128}}
