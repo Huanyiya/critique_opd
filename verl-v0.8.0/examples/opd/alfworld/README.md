@@ -12,12 +12,13 @@ trajectory, the same teacher worker performs two operations:
    prompt augmented with `c`, and once under the exact original student current
    prompt without `c`. The response is never decoded and re-tokenized.
 
-The `reverse_kl_topk` loss first selects the current student's top 16 token IDs
-at each response position. It then gathers the teacher probabilities at those
-same IDs and computes `sum p_student * (log p_student - log p_teacher)` after
-separately normalizing the student and teacher distributions on the
-student-selected support. This is a distributional top-k loss, not the
-sampled-token `kl` estimator.
+The `reverse_kl_topk` loss uses the rollout-time student's top 16 token IDs at
+each response position. The teacher scorer returns log probabilities only for
+those requested IDs, and the actor forward gathers the current student's
+probabilities at the same IDs. The loss computes
+`sum p_student * (log p_student - log p_teacher)` after separately normalizing
+the student and teacher distributions on the student-selected support. This is
+a distributional top-k loss, not the sampled-token `kl` estimator.
 The privileged reverse KL drives the student update. The unprivileged reverse
 KL is computed in the same forward pass as a control and is logged as
 `distillation/unprivileged_reverse_kl`; it is not added to the training loss.
@@ -32,12 +33,13 @@ teacher-identified erroneous action. Later actions are not included in OPD.
 If a training batch contains no failed-trajectory tokens, the actor optimizer
 step is skipped entirely.
 
-The teacher server requests dense prompt log-probability rows for the trainable
-response positions; the generated dummy token is discarded and never enters the
-trajectory. Successful trajectories and tokens after the identified error cutoff
-remain excluded by `response_mask`. The launcher uses eager FSDP logits because
-the fused top-k kernel implements the native forward-KL path rather than this
-reverse-KL loss.
+The teacher server receives the student top-k token IDs for each trainable
+response position and returns a `[num_tokens, topk]` log-probability tensor; no
+full-vocabulary teacher tensor is written to TransferQueue. The generated dummy
+token is discarded and never enters the trajectory. Successful trajectories and
+tokens after the identified error cutoff remain excluded by `response_mask`. The
+launcher uses eager FSDP logits because the fused top-k kernel implements the
+native forward-KL path rather than this reverse-KL loss.
 
 ## Setup
 
@@ -121,3 +123,32 @@ bash examples/opd/alfworld/run_qwen35_alfworld_opd_smoke.sh
 It still requires two GPUs by default: one for the student pool and one for the
 teacher pool. Model loading, vLLM teacher scoring, and the FSDP update are
 GPU-dependent and are not covered by the CPU unit tests.
+
+## 参数解释
+max_model_len=4096 意味着一条序列最多4096 token，表示vLLM 一次请求允许处理的最大总序列长度。
+MAX_MODEL_LEN 最主要的三个使用时机是：
+
+1. Student 每个环境步骤生成 action
+2. Teacher 阅读完整失败轨迹并生成 critique
+3. Teacher 对每个展开步骤计算 privileged/unprivileged logprob
+
+
+max_num_batched_tokens
+限制 vLLM 一次调度中，所有请求加起来处理多少 token。
+
+AGENT_LOOP_WORKERS=12
+AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-${TRAIN_DATA_SIZE}}
+它表示启动 12 个 Ray AgentLoopWorker，用于并发处理这 12 个 prompt。
+
+ppo_mini_batch_size=12
+表示 actor 更新时，每个 optimizer mini-batch 使用：
+全局 12 条训练样本
+这里的“训练样本”现在是展开后的 child：
+某个 step prompt → 某个 step response
+不是完整 ALFWorld trajectory。
+
+ppo_micro_batch_size_per_gpu=2
+表示 actor forward/backward 时，每张 student GPU 一次最多处理2 条样本, 6*2=12
+
+log_prob_micro_batch_size_per_gpu=1
+重新计算 rollout response logprob 时，每张 GPU 一次处理多少条样本。

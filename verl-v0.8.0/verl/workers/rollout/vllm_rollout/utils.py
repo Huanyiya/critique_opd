@@ -376,13 +376,91 @@ def _dense_full_vocab_logprobs(logprobs_dict: dict) -> list[float]:
     return dense_logprobs
 
 
+def _lookup_logprob_entry(logprobs_dict: dict, token_id: int):
+    entry = logprobs_dict.get(token_id)
+    if entry is None:
+        entry = logprobs_dict.get(str(token_id))
+    return entry
+
+
 def extract_sample_logprobs(output: RequestOutput, num_logprobs: Optional[int], result_dict: dict[str, list]):
-    """Extract generated-token full-vocabulary log probabilities when requested."""
-    if num_logprobs != -1:
+    """Extract generated-token log probabilities when requested."""
+    if num_logprobs is None:
         return
-    result_dict["sample_full_logprobs"] = [
-        _dense_full_vocab_logprobs(logprobs_dict) for logprobs_dict in output.outputs[0].logprobs
-    ]
+
+    if num_logprobs == -1:
+        result_dict["sample_full_logprobs"] = [
+            _dense_full_vocab_logprobs(logprobs_dict) for logprobs_dict in output.outputs[0].logprobs
+        ]
+        return
+
+    if num_logprobs <= 0:
+        return
+
+    sample_ids: list[list[int]] = []
+    sample_logprobs: list[list[float]] = []
+    for position, logprobs_dict in enumerate(output.outputs[0].logprobs):
+        ids = [None] * num_logprobs
+        logprobs = [None] * num_logprobs
+        for token_id, token_logprob in logprobs_dict.items():
+            rank = token_logprob.rank
+            if rank > num_logprobs:
+                continue
+            ids[rank - 1] = int(token_id)
+            logprobs[rank - 1] = float(token_logprob.logprob)
+        if any(token_id is None for token_id in ids) or any(logprob is None for logprob in logprobs):
+            raise ValueError(
+                f"vLLM returned incomplete generated-token top-{num_logprobs} logprobs at position {position}."
+            )
+        sample_ids.append(ids)
+        sample_logprobs.append(logprobs)
+    result_dict["sample_ids"] = sample_ids
+    result_dict["sample_logprobs"] = sample_logprobs
+
+
+def extract_prompt_selected_logprobs(
+    output: RequestOutput,
+    prompt_logprob_token_ids: Optional[dict],
+    result_dict: dict[str, list],
+):
+    """Extract prompt logprobs only for caller-specified token ids at selected positions."""
+    if prompt_logprob_token_ids is None:
+        return
+
+    positions = [int(position) for position in prompt_logprob_token_ids.get("positions", [])]
+    token_ids = prompt_logprob_token_ids.get("token_ids", [])
+    if len(positions) != len(token_ids):
+        raise ValueError(
+            "prompt_logprob_token_ids must contain equal-length 'positions' and 'token_ids' lists, "
+            f"got {len(positions)} and {len(token_ids)}."
+        )
+
+    prompt_rows = output.prompt_logprobs[1:]
+    selected_ids: list[list[int]] = []
+    selected_logprobs: list[list[float]] = []
+    for position, row_token_ids in zip(positions, token_ids, strict=True):
+        if position < 0 or position >= len(prompt_rows):
+            raise ValueError(
+                f"Requested prompt logprob position {position} outside available range [0, {len(prompt_rows)})."
+            )
+        logprobs_dict = prompt_rows[position]
+        row_ids = [int(token_id) for token_id in row_token_ids]
+        row_logprobs: list[float] = []
+        for token_id in row_ids:
+            token_logprob = _lookup_logprob_entry(logprobs_dict, token_id)
+            if token_logprob is None:
+                raise ValueError(
+                    "vLLM did not return a requested prompt token id. "
+                    "Set the teacher engine max_logprobs to -1 for student-top-k OPD; "
+                    f"missing token_id={token_id} at position={position}."
+                )
+            row_logprobs.append(float(token_logprob.logprob))
+        selected_ids.append(row_ids)
+        selected_logprobs.append(row_logprobs)
+
+    result_dict["prompt_selected_positions"] = positions
+    result_dict["prompt_selected_ids"] = selected_ids
+    result_dict["prompt_selected_logprobs"] = selected_logprobs
 
 
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):

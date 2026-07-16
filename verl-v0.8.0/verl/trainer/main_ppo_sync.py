@@ -311,7 +311,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             top_p=config.top_p,
             top_k=config.top_k,
             repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs,
+            logprobs=self._rollout_logprobs_request(),
         )
 
         # override sampling params for validation
@@ -400,9 +400,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             outputs = expanded_outputs if isinstance(expanded_outputs, list) else [expanded_outputs]
 
         if final_output.reward_score is not None:
+            reward_extra_info = final_output.extra_fields.get("reward_extra_info")
             for output in outputs[:-1]:
                 output.reward_score = final_output.reward_score
-                output.extra_fields["reward_extra_info"] = final_output.extra_fields["reward_extra_info"]
+                if reward_extra_info is not None:
+                    output.extra_fields["reward_extra_info"] = reward_extra_info
 
         # NOTE: agent loop may has multiple outputs, put each output into TransferQueue.
         # key format: {uid}_{session_id}_{index}
@@ -742,8 +744,60 @@ class PPOTrainer:
 
         logger.info("all initialize finished, ready to fit")
 
+    def _is_alfworld_opd(self) -> bool:
+        return self.config.actor_rollout_ref.rollout.agent.default_agent_loop == "alfworld_opd"
+
+    @staticmethod
+    def _alfworld_env_state_path(checkpoint_folder: str) -> str:
+        return os.path.join(checkpoint_folder, "alfworld_env_state.json")
+
+    def _load_alfworld_env_state(self, checkpoint_folder: str) -> int:
+        state_path = self._alfworld_env_state_path(checkpoint_folder)
+        if not os.path.exists(state_path):
+            return int(self.global_steps)
+        try:
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+            return int(state.get("reset_count", self.global_steps))
+        except Exception:
+            logger.warning(
+                "Failed to load ALFWorld env state from %s; falling back to global_steps=%d",
+                state_path,
+                self.global_steps,
+                exc_info=True,
+            )
+            return int(self.global_steps)
+
+    def _save_alfworld_env_state(self, checkpoint_folder: str) -> None:
+        train_group_count = int(self.config.data.train_batch_size)
+        train_group_size = int(self.config.actor_rollout_ref.rollout.n)
+        train_worker_count = train_group_count * train_group_size
+        reset_count = int(self.global_steps)
+        state = {
+            "reset_count": reset_count,
+            "source": "global_steps",
+            "note": (
+                "ALFWorld OPD resets every train worker exactly once per global step; "
+                "worker reset counts are therefore uniform."
+            ),
+            "train_group_count": train_group_count,
+            "train_group_size": train_group_size,
+            "worker_reset_counts": {str(worker_id): reset_count for worker_id in range(train_worker_count)},
+        }
+        state_path = self._alfworld_env_state_path(checkpoint_folder)
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+
+    def _restore_alfworld_env_state(self) -> None:
+        if not self._is_alfworld_opd():
+            return
+        reset_count = int(getattr(self, "alfworld_resume_reset_count", self.global_steps))
+        self.async_rollout_manager.set_alfworld_resume_reset_count(reset_count)
+        logger.info("Restored ALFWorld train env reset_count=%d", reset_count)
+
     def _load_checkpoint(self):
         self.global_steps = 0
+        self.alfworld_resume_reset_count = 0
 
         # 1. find latest checkpoint folder
         if self.config.trainer.resume_mode == "disable":
@@ -770,6 +824,13 @@ class PPOTrainer:
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
         logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
+        if self._is_alfworld_opd():
+            self.alfworld_resume_reset_count = self._load_alfworld_env_state(global_step_folder)
+            logger.info(
+                "ALFWorld env resume reset_count=%d from checkpoint %s",
+                self.alfworld_resume_reset_count,
+                global_step_folder,
+            )
 
         # 2. load actor checkpoint
         self.actor_rollout_wg.load_checkpoint(
@@ -844,6 +905,8 @@ class PPOTrainer:
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+        if self._is_alfworld_opd():
+            self._save_alfworld_env_state(local_global_step_folder)
 
         # write latest checkpointed iteration tracker for atomic resume
         actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
@@ -1629,6 +1692,7 @@ class PPOTrainer:
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights()
+        self._restore_alfworld_env_state()
 
         # perform validation before training
         if self.config.trainer.get("val_before_train", True):

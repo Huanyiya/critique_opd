@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Optional, Protocol
 from uuid import uuid4
 
+import numpy as np
 import ray
 import yaml
 
@@ -408,6 +409,7 @@ class ALFWorldEnvWorker:
         worker_id: int,
         group_id: int,
         rollout_id: int,
+        resume_reset_count: int = 0,
     ):
         self.config_path = config_path
         self.data_root = data_root
@@ -418,15 +420,100 @@ class ALFWorldEnvWorker:
         self.rollout_id = int(rollout_id)
         self.num_games = num_games
         self._base_env = base_env
-        self._env = base_env.init_env(batch_size=1)
+        self._game_files = list(getattr(base_env, "game_files", []) or [])
+        self.reset_count = int(resume_reset_count)
+        self._next_game_file: Optional[str] = None
+        self._env = None
+        self._initialize_env()
+
+    def _make_textworld_iterator(self, reset_count: int) -> tuple[Any, Optional[str], int]:
+        """Build a TextWorld game iterator positioned at reset_count without reset-skipping.
+
+        TextWorld's batch env does:
+            rng = np.random.RandomState(seed)
+            rng.shuffle(gamefiles)
+            yield the first shuffled order once
+            rng.shuffle(order) before each later cycle
+
+        Reconstruct that exact iterator state by replaying only per-cycle
+        permutations, not by calling env.reset()/env.skip() reset_count times.
+        """
+        if not self._game_files:
+            return iter(()), None, 0
+
+        order = list(self._game_files)
+        rng = np.random.RandomState(self.seed)
+        rng.shuffle(order)
+
+        cycle_index, offset = divmod(max(int(reset_count), 0), len(order))
+        for _ in range(cycle_index):
+            rng.shuffle(order)
+
+        next_game_file = str(order[offset])
+
+        def iterator():
+            current_order = order
+            for game_file in current_order[offset:]:
+                yield game_file
+            while True:
+                rng.shuffle(current_order)
+                for game_file in current_order:
+                    yield game_file
+
+        return iterator(), next_game_file, offset
+
+    def _restore_game_iterator(self) -> None:
+        if self._env is None:
+            return
+        iterator, next_game_file, offset = self._make_textworld_iterator(self.reset_count)
+        if self._game_files:
+            setattr(self._env, "gamefiles", list(self._game_files))
+            setattr(self._env, "_gamefiles_iterator", iterator)
+        self._next_game_file = next_game_file
+        logger.info(
+            "ALFWorld worker %s restored: reset_count=%d cursor=%d next_game=%s",
+            self.worker_id,
+            self.reset_count,
+            offset,
+            next_game_file,
+        )
+
+    def _initialize_env(self) -> None:
+        if self._game_files:
+            self._base_env.game_files = list(self._game_files)
+            self._base_env.num_games = len(self._game_files)
+        close = getattr(self._env, "close", None)
+        if callable(close):
+            close()
+        self._env = self._base_env.init_env(batch_size=1)
         self._env.seed(self.seed)
+        self._restore_game_iterator()
+
+    def set_reset_count(self, reset_count: int) -> dict[str, Any]:
+        self.reset_count = int(reset_count)
+        self._restore_game_iterator()
+        return {
+            "alfworld_worker_id": self.worker_id,
+            "alfworld_group_id": self.group_id,
+            "alfworld_rollout_id": self.rollout_id,
+            "alfworld_reset_count": self.reset_count,
+            "alfworld_next_game_file": self._next_game_file,
+        }
 
     def reset(self) -> tuple[str, dict[str, Any]]:
+        reset_count = self.reset_count
+        expected_game_file = self._next_game_file
         observations, info = self._env.reset()
+        self.reset_count += 1
+        if self._game_files:
+            _, self._next_game_file, _ = self._make_textworld_iterator(self.reset_count)
         flat_info = _flatten_info(info)
         flat_info.setdefault("alfworld_worker_id", self.worker_id)
         flat_info.setdefault("alfworld_group_id", self.group_id)
         flat_info.setdefault("alfworld_rollout_id", self.rollout_id)
+        flat_info.setdefault("alfworld_reset_count", reset_count)
+        if expected_game_file is not None:
+            flat_info.setdefault("alfworld_expected_gamefile", expected_game_file)
         return str(_first(observations)), flat_info
 
     def step(self, action: str) -> ALFWorldTransition:
@@ -507,6 +594,7 @@ class ALFWorldEnvManager:
         self._actors: dict[tuple[str, int], ray.actor.ActorHandle] = {}
         self._owned_actor_names: set[str] = set()
         self._base_envs: dict[tuple[str, str], Any] = {}
+        self.train_resume_reset_count = 0
 
         if self.train_num_groups <= 0 or self.train_group_size <= 0:
             raise ValueError(
@@ -614,6 +702,7 @@ class ALFWorldEnvManager:
                 worker_id=worker_id,
                 group_id=group_id,
                 rollout_id=rollout_id,
+                resume_reset_count=self.train_resume_reset_count if pool_key == "train" else 0,
             )
             self._owned_actor_names.add(actor_name)
         except ValueError:
@@ -623,6 +712,28 @@ class ALFWorldEnvManager:
 
         self._actors[actor_key] = actor
         return actor
+
+    def set_train_reset_count(self, reset_count: int) -> None:
+        self.train_resume_reset_count = int(reset_count)
+        self._ensure_pool(validate=False)
+        train_worker_count = self.train_num_groups * self.train_group_size
+        ray.get(
+            [
+                self._get_or_create_actor(
+                    pool_key="train",
+                    split=self.train_split,
+                    seed_base=self.seed,
+                    group_size=self.train_group_size,
+                    worker_id=worker_id,
+                ).set_reset_count.remote(self.train_resume_reset_count)
+                for worker_id in range(train_worker_count)
+            ]
+        )
+        logger.warning(
+            "ALFWorld train env pool cursor restored to reset_count=%d for %d workers",
+            self.train_resume_reset_count,
+            train_worker_count,
+        )
 
     def _ensure_pool(self, validate: bool) -> None:
         pool_key, split, seed_base, num_groups, group_size = self._pool_spec(validate)
@@ -774,6 +885,33 @@ def initialize_alfworld_env_manager_from_config(config: Any) -> None:
         env_pool_name=os.environ.get("ALFWORLD_ENV_POOL_NAME"),
         env_worker_num_cpus=float(os.environ.get("ALFWORLD_ENV_WORKER_NUM_CPUS", "0.1")),
     )
+
+
+def set_alfworld_env_resume_reset_count_from_config(config: Any, reset_count: int) -> None:
+    """Restore the persistent ALFWorld train pool cursor after checkpoint resume."""
+    default_agent_loop = _config_get(config, "actor_rollout_ref.rollout.agent.default_agent_loop")
+    if default_agent_loop != "alfworld_opd":
+        return
+
+    seed = int(os.environ.get("ALFWORLD_SEED", "0"))
+    num_games_env = os.environ.get("ALFWORLD_NUM_GAMES")
+    num_games = (
+        int(num_games_env)
+        if num_games_env is not None and str(num_games_env).lower() not in {"", "none", "null"}
+        else None
+    )
+    manager = get_alfworld_env_manager(
+        trainer_config=config,
+        config_path=os.environ.get("ALFWORLD_CONFIG_PATH"),
+        data_root=os.environ.get("ALFWORLD_DATA"),
+        train_split=os.environ.get("ALFWORLD_TRAIN_SPLIT", "train"),
+        eval_split=os.environ.get("ALFWORLD_EVAL_SPLIT", "eval_in_distribution"),
+        seed=seed,
+        num_games=num_games,
+        env_pool_name=os.environ.get("ALFWORLD_ENV_POOL_NAME"),
+        env_worker_num_cpus=float(os.environ.get("ALFWORLD_ENV_WORKER_NUM_CPUS", "0.1")),
+    )
+    manager.set_train_reset_count(int(reset_count))
 
 
 class InstalledALFWorldEnvironmentFactory:
@@ -932,8 +1070,10 @@ class ALFWorldAgentLoop(AgentLoopBase):
         opd_step_prompt_texts: list[str] = []
         opd_step_response_ids: list[list[int]] = []
         opd_step_response_logprobs: list[list[float]] = []
+        opd_step_student_topk_ids: list[list[list[int]]] = []
         total_action_tokens = 0
         logprobs_available = True
+        student_topk_ids_available = True
         history: list[dict[str, Any]] = []
         turn_rewards: list[float] = []
         server_extra_fields: dict[str, Any] = {}
@@ -977,10 +1117,15 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 )
                 generate_seconds += time.perf_counter() - started
                 num_preempted += output.num_preempted if output.num_preempted is not None else 0
+                lightweight_extra_fields = {
+                    key: value
+                    for key, value in output.extra_fields.items()
+                    if key not in {"sample_ids", "sample_logprobs", "sample_full_logprobs"}
+                }
                 if not server_extra_fields:
-                    server_extra_fields.update(output.extra_fields)
-                elif output.extra_fields.get("max_global_steps") is not None:
-                    server_extra_fields["max_global_steps"] = output.extra_fields["max_global_steps"]
+                    server_extra_fields.update(lightweight_extra_fields)
+                elif lightweight_extra_fields.get("max_global_steps") is not None:
+                    server_extra_fields["max_global_steps"] = lightweight_extra_fields["max_global_steps"]
 
                 generated_ids = list(output.token_ids[:turn_max_tokens])
                 if not generated_ids:
@@ -989,6 +1134,15 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 opd_step_prompt_ids.append(list(current_prompt_ids))
                 opd_step_prompt_texts.append(current_prompt_text)
                 opd_step_response_ids.append(list(generated_ids))
+                sample_topk_ids = output.extra_fields.get("sample_ids")
+                if sample_topk_ids is None:
+                    student_topk_ids_available = False
+                elif student_topk_ids_available:
+                    current_topk_ids = [list(row) for row in sample_topk_ids[: len(generated_ids)]]
+                    if len(current_topk_ids) != len(generated_ids):
+                        student_topk_ids_available = False
+                    else:
+                        opd_step_student_topk_ids.append(current_topk_ids)
                 total_action_tokens += len(generated_ids)
                 response_step_end_indices.append(total_action_tokens)
                 current_logprobs = None
@@ -1126,6 +1280,9 @@ class ALFWorldAgentLoop(AgentLoopBase):
             opd_step_response_ids=opd_step_response_ids,
             opd_step_response_logprobs=opd_step_response_logprobs
             if logprobs_available and len(opd_step_response_logprobs) == len(opd_step_response_ids)
+            else None,
+            opd_step_student_topk_ids=opd_step_student_topk_ids
+            if student_topk_ids_available and len(opd_step_student_topk_ids) == len(opd_step_response_ids)
             else None,
             response_ids=summary_response_ids,
             response_mask=summary_response_mask,

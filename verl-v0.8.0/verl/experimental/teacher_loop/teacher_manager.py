@@ -238,11 +238,17 @@ class AsyncTeacherLLMServerManager:
             raise ValueError(f"vocab_size must be positive, got {vocab_size}.")
         return torch.empty((0,), dtype=torch.int64), torch.empty((0, 1), dtype=torch.float32)
 
-    def empty_teacher_response_full_vocab_outputs(self, *, vocab_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build zero-row dense teacher tensors for student-top-k reverse KL."""
-        if vocab_size <= 0:
-            raise ValueError(f"vocab_size must be positive, got {vocab_size}.")
-        return torch.empty((0,), dtype=torch.int64), torch.empty((0, vocab_size), dtype=torch.float32)
+    def empty_teacher_student_topk_outputs(
+        self, *, topk: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build zero-row sparse teacher tensors for student-top-k reverse KL."""
+        if topk <= 0:
+            raise ValueError(f"topk must be positive, got {topk}.")
+        return (
+            torch.empty((0,), dtype=torch.int64),
+            torch.empty((0, topk), dtype=torch.int64),
+            torch.empty((0, topk), dtype=torch.float32),
+        )
 
     async def generate_teacher_critique_single(
         self,
@@ -368,26 +374,21 @@ class AsyncTeacherLLMServerManager:
         selected_teacher_logprobs = teacher_logprobs.index_select(0, teacher_predictor_rows)
         return response_indices, selected_teacher_logprobs
 
-    async def compute_teacher_response_full_vocab_logprobs_single(
+    async def compute_teacher_student_topk_logprobs_single(
         self,
         *,
         sequence_ids: list[int],
         teacher_prompt_length: int,
         response_mask: list[int],
+        student_topk_ids: torch.Tensor,
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute dense teacher logprobs for response rows selected by ``response_mask``.
-
-        ``reverse_kl_topk`` uses the current student top-k IDs as the support.
-        Those IDs are only known during the actor forward pass, so the teacher
-        provides dense response-position logprobs here and the loss later gathers
-        the student-selected IDs.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute teacher logprobs only for rollout-time student top-k token ids."""
         if not self.uses_student_topk_support:
             raise RuntimeError(
-                "compute_teacher_response_full_vocab_logprobs_single requires reverse_kl_topk student-top-k mode."
+                "compute_teacher_student_topk_logprobs_single requires reverse_kl_topk student-top-k mode."
             )
         if len(sequence_ids) != teacher_prompt_length + len(response_mask):
             raise ValueError(
@@ -395,21 +396,28 @@ class AsyncTeacherLLMServerManager:
                 f"sequence={len(sequence_ids)}, prompt={teacher_prompt_length}, response={len(response_mask)}."
             )
 
-        multi_modal_data = multi_modal_data or {}
-        teacher_key = self._resolve_teacher_key(routing_key)
-        teacher_model_config = self.teacher_model_configs[teacher_key]
-        if teacher_model_config.inference.temperature != 1.0:
-            raise NotImplementedError("Teacher full-vocab prompt_logprobs require teacher temperature 1.0.")
-        client = self.teacher_client[teacher_key]
         response_indices = torch.tensor(
             [index for index, mask_value in enumerate(response_mask) if bool(mask_value)], dtype=torch.int64
         )
         if response_indices.numel() == 0:
             raise ValueError(
                 "Teacher student-top-k scoring received no trainable response tokens. "
-                "Excluded OPD trajectories should use empty_teacher_response_full_vocab_outputs instead."
+                "Excluded OPD trajectories should use empty_teacher_student_topk_outputs instead."
+            )
+        student_topk_ids = student_topk_ids.to(dtype=torch.int64, device="cpu")
+        if student_topk_ids.dim() != 2 or student_topk_ids.shape[0] != response_indices.numel():
+            raise ValueError(
+                "student_topk_ids must have shape [num_trainable_response_tokens, topk], got "
+                f"{student_topk_ids.shape} for {response_indices.numel()} response tokens."
             )
 
+        multi_modal_data = multi_modal_data or {}
+        teacher_key = self._resolve_teacher_key(routing_key)
+        teacher_model_config = self.teacher_model_configs[teacher_key]
+        if teacher_model_config.inference.temperature != 1.0:
+            raise NotImplementedError("Teacher selected prompt logprobs require teacher temperature 1.0.")
+        client = self.teacher_client[teacher_key]
+        teacher_predictor_rows = teacher_prompt_length - 1 + response_indices
         teacher_output = await client.generate(
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
@@ -417,19 +425,28 @@ class AsyncTeacherLLMServerManager:
                 "max_tokens": 1,
                 "temperature": teacher_model_config.inference.temperature,
                 "prompt_logprobs": -1,
+                "prompt_logprob_token_ids": {
+                    "positions": teacher_predictor_rows.tolist(),
+                    "token_ids": student_topk_ids.tolist(),
+                },
             },
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
             audio_data=multi_modal_data.get("audios"),
             mm_processor_kwargs=mm_processor_kwargs,
         )
-        teacher_full_logprobs = torch.tensor(
-            teacher_output.extra_fields["prompt_full_logprobs"], dtype=torch.float32
+        returned_ids = torch.tensor(teacher_output.extra_fields["prompt_selected_ids"], dtype=torch.int64)
+        teacher_topk_logprobs = torch.tensor(
+            teacher_output.extra_fields["prompt_selected_logprobs"], dtype=torch.float32
         )
-        if teacher_full_logprobs.dim() != 2 or teacher_full_logprobs.shape[0] != len(sequence_ids):
+        if returned_ids.shape != student_topk_ids.shape or not torch.equal(returned_ids, student_topk_ids):
             raise ValueError(
-                "Teacher full-vocab prompt_logprobs must have shape [teacher_prompt + response, vocab], "
-                f"got {teacher_full_logprobs.shape} for sequence length {len(sequence_ids)}."
+                "Teacher selected prompt logprobs were not returned for the requested student top-k ids: "
+                f"returned={returned_ids.shape}, requested={student_topk_ids.shape}."
             )
-        teacher_predictor_rows = teacher_prompt_length - 1 + response_indices
-        return response_indices, teacher_full_logprobs.index_select(0, teacher_predictor_rows)
+        if teacher_topk_logprobs.shape != student_topk_ids.shape:
+            raise ValueError(
+                "Teacher selected prompt logprobs must match student_topk_ids shape, got "
+                f"{teacher_topk_logprobs.shape} vs {student_topk_ids.shape}."
+            )
+        return response_indices, student_topk_ids, teacher_topk_logprobs

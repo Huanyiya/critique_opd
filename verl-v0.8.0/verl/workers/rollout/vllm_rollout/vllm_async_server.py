@@ -50,6 +50,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     SuppressSignalInThread,
     build_cli_args_from_config,
     extract_prompt_logprobs,
+    extract_prompt_selected_logprobs,
     extract_sample_logprobs,
     get_vllm_max_lora_rank,
 )
@@ -501,6 +502,10 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
+        prompt_logprob_token_ids = sampling_params.pop("prompt_logprob_token_ids", None)
+        if prompt_logprob_token_ids is not None:
+            sampling_params["prompt_logprobs"] = -1
+
         requested_logprobs = sampling_params.pop("logprobs", False)
         if requested_logprobs is True:
             sampling_params["logprobs"] = 0
@@ -565,11 +570,18 @@ class vLLMHttpServer:
             )
 
         extra_fields = {"global_steps": self.global_steps}
-        extract_prompt_logprobs(
-            output=final_res,
-            num_prompt_logprobs=sampling_params.prompt_logprobs,
-            result_dict=extra_fields,
-        )
+        if prompt_logprob_token_ids is not None:
+            extract_prompt_selected_logprobs(
+                output=final_res,
+                prompt_logprob_token_ids=prompt_logprob_token_ids,
+                result_dict=extra_fields,
+            )
+        else:
+            extract_prompt_logprobs(
+                output=final_res,
+                num_prompt_logprobs=sampling_params.prompt_logprobs,
+                result_dict=extra_fields,
+            )
         extract_sample_logprobs(
             output=final_res,
             num_logprobs=sampling_params.logprobs,

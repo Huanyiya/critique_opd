@@ -17,6 +17,7 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-160}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
+TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-32768}
 
 STUDENT_GPUS_PER_NODE=${STUDENT_GPUS_PER_NODE:-6}
 TEACHER_GPUS_PER_NODE=${TEACHER_GPUS_PER_NODE:-2}
@@ -46,7 +47,7 @@ PREPARE_DATA_ARGS=(
     --output-dir "${DATA_DIR}"
     --train-data-size "${TRAIN_DATA_SIZE}"
     --val-data-size "${VAL_DATA_SIZE}"
-    --eval-split "${ALFWORLD_EVAL_SPLIT:-eval_in_distribution}"
+    --eval-split "${ALFWORLD_EVAL_SPLIT:-eval_out_of_distribution}"
 )
 
 python3 "${ROOT_DIR}/examples/opd/alfworld/prepare_data.py" "${PREPARE_DATA_ARGS[@]}"
@@ -81,7 +82,7 @@ python3 -m verl.trainer.main_ppo_sync \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${STUDENT_TP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
-    actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.agent.num_workers="${AGENT_LOOP_WORKERS}" \
@@ -94,8 +95,8 @@ python3 -m verl.trainer.main_ppo_sync \
     distillation.teacher_models.teacher_model.inference.name=vllm \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size="${TEACHER_TP}" \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="${TEACHER_GPU_MEMORY_UTILIZATION}" \
-    distillation.teacher_models.teacher_model.inference.max_model_len="${MAX_MODEL_LEN}" \
-    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens="${MAX_MODEL_LEN}" \
+    distillation.teacher_models.teacher_model.inference.max_model_len="${TEACHER_MAX_MODEL_LEN}" \
+    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=4096 \
     distillation.distillation_loss.loss_mode=reverse_kl_topk \
     distillation.distillation_loss.topk=16 \
     distillation.distillation_loss.log_prob_min_clamp=null \
