@@ -240,7 +240,7 @@ class AsyncTeacherLLMServerManager:
 
     def empty_teacher_student_topk_outputs(
         self, *, topk: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build zero-row sparse teacher tensors for student-top-k reverse KL."""
         if topk <= 0:
             raise ValueError(f"topk must be positive, got {topk}.")
@@ -248,6 +248,7 @@ class AsyncTeacherLLMServerManager:
             torch.empty((0,), dtype=torch.int64),
             torch.empty((0, topk), dtype=torch.int64),
             torch.empty((0, topk), dtype=torch.float32),
+            torch.empty((0, topk), dtype=torch.int64),
         )
 
     async def generate_teacher_critique_single(
@@ -384,7 +385,7 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute teacher logprobs only for rollout-time student top-k token ids."""
         if not self.uses_student_topk_support:
             raise RuntimeError(
@@ -439,6 +440,9 @@ class AsyncTeacherLLMServerManager:
         teacher_topk_logprobs = torch.tensor(
             teacher_output.extra_fields["prompt_selected_logprobs"], dtype=torch.float32
         )
+        teacher_topk_ids = torch.tensor(
+            teacher_output.extra_fields["prompt_teacher_topk_ids"], dtype=torch.int64
+        )
         if returned_ids.shape != student_topk_ids.shape or not torch.equal(returned_ids, student_topk_ids):
             raise ValueError(
                 "Teacher selected prompt logprobs were not returned for the requested student top-k ids: "
@@ -449,4 +453,9 @@ class AsyncTeacherLLMServerManager:
                 "Teacher selected prompt logprobs must match student_topk_ids shape, got "
                 f"{teacher_topk_logprobs.shape} vs {student_topk_ids.shape}."
             )
-        return response_indices, student_topk_ids, teacher_topk_logprobs
+        if teacher_topk_ids.shape != student_topk_ids.shape:
+            raise ValueError(
+                "Teacher top-k ids must match student_topk_ids shape, got "
+                f"{teacher_topk_ids.shape} vs {student_topk_ids.shape}."
+            )
+        return response_indices, student_topk_ids, teacher_topk_logprobs, teacher_topk_ids

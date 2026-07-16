@@ -189,12 +189,16 @@ class AgentLoopOutput(BaseModel):
             output["extra_fields"].pop("unprivileged_teacher_ids", None),
             output["extra_fields"].pop("unprivileged_teacher_logprobs", None),
         )
-        student_topk_ids, teacher_topk_logprobs = (
+        student_topk_ids, teacher_topk_logprobs, teacher_topk_ids = (
             output["extra_fields"].pop("student_topk_ids", None),
             output["extra_fields"].pop("teacher_topk_logprobs", None),
+            output["extra_fields"].pop("teacher_topk_ids", None),
         )
         unprivileged_teacher_topk_logprobs = output["extra_fields"].pop(
             "unprivileged_teacher_topk_logprobs", None
+        )
+        unprivileged_teacher_topk_ids = output["extra_fields"].pop(
+            "unprivileged_teacher_topk_ids", None
         )
         teacher_response_indices, teacher_full_logprobs = (
             output["extra_fields"].pop("teacher_response_indices", None),
@@ -216,8 +220,12 @@ class AgentLoopOutput(BaseModel):
             output["student_topk_ids"] = student_topk_ids
         if teacher_topk_logprobs is not None:
             output["teacher_topk_logprobs"] = teacher_topk_logprobs
+        if teacher_topk_ids is not None:
+            output["teacher_topk_ids"] = teacher_topk_ids
         if unprivileged_teacher_topk_logprobs is not None:
             output["unprivileged_teacher_topk_logprobs"] = unprivileged_teacher_topk_logprobs
+        if unprivileged_teacher_topk_ids is not None:
+            output["unprivileged_teacher_topk_ids"] = unprivileged_teacher_topk_ids
         if teacher_response_indices is not None:
             output["teacher_response_indices"] = teacher_response_indices
         if teacher_full_logprobs is not None:
@@ -260,8 +268,12 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Student-selected top-k token ids for selected response positions."""
     teacher_topk_logprobs: Optional[torch.Tensor] = None
     """Teacher log probabilities gathered at student-selected top-k token ids."""
+    teacher_topk_ids: Optional[torch.Tensor] = None
+    """Teacher-selected top-k token ids for overlap diagnostics."""
     unprivileged_teacher_topk_logprobs: Optional[torch.Tensor] = None
     """Unprivileged teacher log probabilities gathered at student-selected top-k ids."""
+    unprivileged_teacher_topk_ids: Optional[torch.Tensor] = None
+    """Unprivileged teacher-selected top-k token ids for overlap diagnostics."""
     teacher_response_indices: Optional[torch.Tensor] = None
     """Response-local positions with full-vocabulary teacher distributions."""
     teacher_full_logprobs: Optional[torch.Tensor] = None
@@ -837,12 +849,16 @@ class AgentLoopWorker:
             output.extra_fields.pop("unprivileged_teacher_ids", None),
             output.extra_fields.pop("unprivileged_teacher_logprobs", None),
         )
-        student_topk_ids, teacher_topk_logprobs = (
+        student_topk_ids, teacher_topk_logprobs, teacher_topk_ids = (
             output.extra_fields.pop("student_topk_ids", None),
             output.extra_fields.pop("teacher_topk_logprobs", None),
+            output.extra_fields.pop("teacher_topk_ids", None),
         )
         unprivileged_teacher_topk_logprobs = output.extra_fields.pop(
             "unprivileged_teacher_topk_logprobs", None
+        )
+        unprivileged_teacher_topk_ids = output.extra_fields.pop(
+            "unprivileged_teacher_topk_ids", None
         )
         teacher_response_indices, teacher_full_logprobs = (
             output.extra_fields.pop("teacher_response_indices", None),
@@ -895,7 +911,9 @@ class AgentLoopWorker:
             unprivileged_teacher_ids=unprivileged_teacher_ids,
             student_topk_ids=student_topk_ids,
             teacher_topk_logprobs=teacher_topk_logprobs,
+            teacher_topk_ids=teacher_topk_ids,
             unprivileged_teacher_topk_logprobs=unprivileged_teacher_topk_logprobs,
+            unprivileged_teacher_topk_ids=unprivileged_teacher_topk_ids,
             teacher_response_indices=teacher_response_indices,
             teacher_full_logprobs=teacher_full_logprobs,
             unprivileged_teacher_response_indices=unprivileged_teacher_response_indices,
@@ -1021,12 +1039,16 @@ class AgentLoopWorker:
             output.extra_fields.pop("unprivileged_teacher_ids", None),
             output.extra_fields.pop("unprivileged_teacher_logprobs", None),
         )
-        student_topk_ids, teacher_topk_logprobs = (
+        student_topk_ids, teacher_topk_logprobs, teacher_topk_ids = (
             output.extra_fields.pop("student_topk_ids", None),
             output.extra_fields.pop("teacher_topk_logprobs", None),
+            output.extra_fields.pop("teacher_topk_ids", None),
         )
         unprivileged_teacher_topk_logprobs = output.extra_fields.pop(
             "unprivileged_teacher_topk_logprobs", None
+        )
+        unprivileged_teacher_topk_ids = output.extra_fields.pop(
+            "unprivileged_teacher_topk_ids", None
         )
         teacher_response_indices, teacher_full_logprobs = (
             output.extra_fields.pop("teacher_response_indices", None),
@@ -1080,7 +1102,9 @@ class AgentLoopWorker:
             unprivileged_teacher_ids=unprivileged_teacher_ids,
             student_topk_ids=student_topk_ids,
             teacher_topk_logprobs=teacher_topk_logprobs,
+            teacher_topk_ids=teacher_topk_ids,
             unprivileged_teacher_topk_logprobs=unprivileged_teacher_topk_logprobs,
+            unprivileged_teacher_topk_ids=unprivileged_teacher_topk_ids,
             teacher_response_indices=teacher_response_indices,
             teacher_full_logprobs=teacher_full_logprobs,
             unprivileged_teacher_response_indices=unprivileged_teacher_response_indices,
@@ -1233,7 +1257,7 @@ class AgentLoopWorker:
     def _populate_empty_teacher_outputs(self, output: AgentLoopOutput, prompt_ids: list[int]) -> None:
         """Attach shape-compatible empty teacher outputs for trajectories excluded from OPD."""
         if getattr(self.teacher_server_manager, "uses_student_topk_support", False):
-            teacher_response_indices, student_topk_ids, teacher_topk_logprobs = (
+            teacher_response_indices, student_topk_ids, teacher_topk_logprobs, teacher_topk_ids = (
                 self.teacher_server_manager.empty_teacher_student_topk_outputs(
                     topk=int(self.teacher_server_manager.distillation_loss_config.topk),
                 )
@@ -1241,8 +1265,10 @@ class AgentLoopWorker:
             output.extra_fields["teacher_response_indices"] = teacher_response_indices
             output.extra_fields["student_topk_ids"] = student_topk_ids
             output.extra_fields["teacher_topk_logprobs"] = teacher_topk_logprobs
+            output.extra_fields["teacher_topk_ids"] = teacher_topk_ids
             output.extra_fields["unprivileged_teacher_response_indices"] = teacher_response_indices.clone()
             output.extra_fields["unprivileged_teacher_topk_logprobs"] = teacher_topk_logprobs.clone()
+            output.extra_fields["unprivileged_teacher_topk_ids"] = teacher_topk_ids.clone()
             return
 
         if getattr(self.teacher_server_manager, "uses_full_vocab", False):
@@ -1426,9 +1452,11 @@ class AgentLoopWorker:
                 "teacher_ids",
                 "teacher_logprobs",
                 "teacher_topk_logprobs",
+                "teacher_topk_ids",
                 "unprivileged_teacher_ids",
                 "unprivileged_teacher_logprobs",
                 "unprivileged_teacher_topk_logprobs",
+                "unprivileged_teacher_topk_ids",
                 "teacher_response_indices",
                 "teacher_full_logprobs",
                 "unprivileged_teacher_response_indices",
@@ -1630,7 +1658,7 @@ class AgentLoopWorker:
             if not isinstance(student_topk_ids, torch.Tensor):
                 student_topk_ids = torch.tensor(student_topk_ids, dtype=torch.int64)
 
-            teacher_response_indices, student_topk_ids, teacher_topk_logprobs = (
+            teacher_response_indices, student_topk_ids, teacher_topk_logprobs, teacher_topk_ids = (
                 await self.teacher_server_manager.compute_teacher_student_topk_logprobs_single(
                     sequence_ids=teacher_prompt_ids + response_ids,
                     teacher_prompt_length=len(teacher_prompt_ids),
@@ -1644,9 +1672,15 @@ class AgentLoopWorker:
             output.extra_fields["teacher_response_indices"] = teacher_response_indices
             output.extra_fields["student_topk_ids"] = student_topk_ids
             output.extra_fields["teacher_topk_logprobs"] = teacher_topk_logprobs
+            output.extra_fields["teacher_topk_ids"] = teacher_topk_ids
 
             if output.extra_fields.get("opd_selected", False):
-                unprivileged_teacher_response_indices, _, unprivileged_teacher_topk_logprobs = (
+                (
+                    unprivileged_teacher_response_indices,
+                    _,
+                    unprivileged_teacher_topk_logprobs,
+                    unprivileged_teacher_topk_ids,
+                ) = (
                     await self.teacher_server_manager.compute_teacher_student_topk_logprobs_single(
                         sequence_ids=prompt_ids + response_ids,
                         teacher_prompt_length=len(prompt_ids),
@@ -1659,6 +1693,7 @@ class AgentLoopWorker:
                 )
                 output.extra_fields["unprivileged_teacher_response_indices"] = unprivileged_teacher_response_indices
                 output.extra_fields["unprivileged_teacher_topk_logprobs"] = unprivileged_teacher_topk_logprobs
+                output.extra_fields["unprivileged_teacher_topk_ids"] = unprivileged_teacher_topk_ids
                 output.extra_fields["unprivileged_teacher_prompt_matches_student"] = True
             return None
 
@@ -1757,10 +1792,18 @@ class AgentLoopWorker:
             optional_outputs["teacher_topk_logprobs"] = torch.nested.as_nested_tensor(
                 [input.teacher_topk_logprobs for input in inputs], layout=torch.jagged
             )
+            if inputs[0].teacher_topk_ids is not None:
+                optional_outputs["teacher_topk_ids"] = torch.nested.as_nested_tensor(
+                    [input.teacher_topk_ids for input in inputs], layout=torch.jagged
+                )
         if inputs[0].unprivileged_teacher_topk_logprobs is not None:
             optional_outputs["unprivileged_teacher_topk_logprobs"] = torch.nested.as_nested_tensor(
                 [input.unprivileged_teacher_topk_logprobs for input in inputs], layout=torch.jagged
             )
+            if inputs[0].unprivileged_teacher_topk_ids is not None:
+                optional_outputs["unprivileged_teacher_topk_ids"] = torch.nested.as_nested_tensor(
+                    [input.unprivileged_teacher_topk_ids for input in inputs], layout=torch.jagged
+                )
         if inputs[0].teacher_full_logprobs is not None and inputs[0].teacher_response_indices is not None:
             optional_outputs["teacher_full_logprobs"] = torch.nested.as_nested_tensor(
                 [input.teacher_full_logprobs for input in inputs], layout=torch.jagged

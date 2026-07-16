@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import heapq
 import json
 import logging
 import os
@@ -383,6 +384,20 @@ def _lookup_logprob_entry(logprobs_dict: dict, token_id: int):
     return entry
 
 
+def _topk_ids_from_logprobs_dict(logprobs_dict: dict, k: int) -> list[int]:
+    """Return the token ids with the k largest log-probabilities from one vLLM logprob row."""
+    if k <= 0:
+        return []
+    top_entries = heapq.nlargest(
+        k,
+        ((float(token_logprob.logprob), int(token_id)) for token_id, token_logprob in logprobs_dict.items()),
+        key=lambda item: item[0],
+    )
+    if len(top_entries) != k:
+        raise ValueError(f"vLLM returned only {len(top_entries)} prompt logprobs, cannot build teacher top-{k}.")
+    return [token_id for _logprob, token_id in top_entries]
+
+
 def extract_sample_logprobs(output: RequestOutput, num_logprobs: Optional[int], result_dict: dict[str, list]):
     """Extract generated-token log probabilities when requested."""
     if num_logprobs is None:
@@ -438,6 +453,7 @@ def extract_prompt_selected_logprobs(
     prompt_rows = output.prompt_logprobs[1:]
     selected_ids: list[list[int]] = []
     selected_logprobs: list[list[float]] = []
+    teacher_topk_ids: list[list[int]] = []
     for position, row_token_ids in zip(positions, token_ids, strict=True):
         if position < 0 or position >= len(prompt_rows):
             raise ValueError(
@@ -445,6 +461,7 @@ def extract_prompt_selected_logprobs(
             )
         logprobs_dict = prompt_rows[position]
         row_ids = [int(token_id) for token_id in row_token_ids]
+        teacher_topk_ids.append(_topk_ids_from_logprobs_dict(logprobs_dict, len(row_ids)))
         row_logprobs: list[float] = []
         for token_id in row_ids:
             token_logprob = _lookup_logprob_entry(logprobs_dict, token_id)
@@ -461,6 +478,7 @@ def extract_prompt_selected_logprobs(
     result_dict["prompt_selected_positions"] = positions
     result_dict["prompt_selected_ids"] = selected_ids
     result_dict["prompt_selected_logprobs"] = selected_logprobs
+    result_dict["prompt_teacher_topk_ids"] = teacher_topk_ids
 
 
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
