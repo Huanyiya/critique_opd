@@ -515,10 +515,12 @@ class PPOTrainer:
         config: DictConfig,
         role_worker_mapping: dict[Role, WorkerType],
         resource_pool_manager: ResourcePoolManager,
+        alfworld_env_manager: ray.actor.ActorHandle | None = None,
     ):
         self.config = config
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
+        self.alfworld_env_manager = alfworld_env_manager
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
@@ -726,6 +728,7 @@ class PPOTrainer:
             llm_client=self.llm_server_manager.get_client(),
             teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
             reward_loop_worker_handles=self.reward_loop_manager.reward_loop_workers,
+            alfworld_env_manager=self.alfworld_env_manager,
             replay_buffer=self.replay_buffer,
         )
         logger.info("agent loop manager initialized")
@@ -1911,22 +1914,46 @@ class TaskRunner:
         # initialize transfer queue
         tq.init(config.transfer_queue)
         trainer = None
+        alfworld_env_manager = None
         try:
             self.add_actor_rollout_worker(config)
             self.add_critic_worker(config)
             self.init_resource_pool_mgr(config)
 
+            if config.actor_rollout_ref.rollout.agent.default_agent_loop == "alfworld_opd":
+                from verl.experimental.agent_loop.alfworld_agent_loop import (
+                    create_alfworld_env_manager_actor_from_config,
+                )
+
+                alfworld_env_manager = create_alfworld_env_manager_actor_from_config(config)
+
             trainer = PPOTrainer(
                 config=config,
                 role_worker_mapping=self.role_worker_mapping,
                 resource_pool_manager=self.resource_pool_manager,
+                alfworld_env_manager=alfworld_env_manager,
             )
             trainer.init_workers()
             trainer.fit()
         finally:
-            if trainer:
-                trainer.replay_buffer.close()
-            tq.close()
+            try:
+                if trainer:
+                    async_rollout_manager = getattr(trainer, "async_rollout_manager", None)
+                    if async_rollout_manager is not None:
+                        async_rollout_manager.close()
+            finally:
+                try:
+                    if trainer:
+                        trainer.replay_buffer.close()
+                finally:
+                    try:
+                        if alfworld_env_manager is not None:
+                            try:
+                                ray.get(alfworld_env_manager.close.remote(), timeout=60)
+                            finally:
+                                ray.kill(alfworld_env_manager, no_restart=True)
+                    finally:
+                        tq.close()
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)

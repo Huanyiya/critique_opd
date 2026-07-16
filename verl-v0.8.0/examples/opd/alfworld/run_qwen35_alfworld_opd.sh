@@ -9,6 +9,7 @@ TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/mnt/cpfs/weights/Qwen3.5-9B}
 
 DATA_DIR=${DATA_DIR:-${HOME}/data/alfworld_opd}
 export ALFWORLD_DATA=${ALFWORLD_DATA:-/mnt/cpfs/datasets/alfworld}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3,4,5,6,7}
 OUTPUT_DIR=${OUTPUT_DIR:-${ROOT_DIR}/checkpoints/alfworld_opd}
 TRAIN_DATA_SIZE=${TRAIN_DATA_SIZE:-12}
 VAL_DATA_SIZE=${VAL_DATA_SIZE:-64}
@@ -19,7 +20,7 @@ MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-32768}
 
-STUDENT_GPUS_PER_NODE=${STUDENT_GPUS_PER_NODE:-6}
+STUDENT_GPUS_PER_NODE=${STUDENT_GPUS_PER_NODE:-4}
 TEACHER_GPUS_PER_NODE=${TEACHER_GPUS_PER_NODE:-2}
 NNODES=${NNODES:-1}
 STUDENT_TP=${STUDENT_TP:-1}
@@ -71,7 +72,7 @@ python3 -m verl.trainer.main_ppo_sync \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_DATA_SIZE}" \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.use_torch_compile=False \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \

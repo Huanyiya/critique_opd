@@ -520,11 +520,13 @@ class AgentLoopWorker:
         llm_client: LLMServerClient,
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        alfworld_env_manager: Optional[ray.actor.ActorHandle] = None,
     ):
         self.config = config
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.alfworld_env_manager = alfworld_env_manager
 
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
@@ -566,10 +568,11 @@ class AgentLoopWorker:
                 self.model_config.processor.chat_template = self.model_config.custom_chat_template
             self.model_config.tokenizer.chat_template = self.model_config.custom_chat_template
 
-        if config.actor_rollout_ref.rollout.agent.default_agent_loop == "alfworld_opd":
-            from verl.experimental.agent_loop.alfworld_agent_loop import initialize_alfworld_env_manager_from_config
-
-            initialize_alfworld_env_manager_from_config(config)
+        if (
+            config.actor_rollout_ref.rollout.agent.default_agent_loop == "alfworld_opd"
+            and self.alfworld_env_manager is None
+        ):
+            raise ValueError("alfworld_opd requires the central TaskRunner-owned ALFWorld environment manager")
 
         trace_config = self.rollout_config.trace
         RolloutTraceConfig.init(
@@ -579,13 +582,6 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
-
-    def set_alfworld_resume_reset_count(self, reset_count: int) -> None:
-        if self.config.actor_rollout_ref.rollout.agent.default_agent_loop != "alfworld_opd":
-            return
-        from verl.experimental.agent_loop.alfworld_agent_loop import set_alfworld_env_resume_reset_count_from_config
-
-        set_alfworld_env_resume_reset_count_from_config(self.config, int(reset_count))
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
         """Return multimodal processor kwargs with audio sampling-rate defaults."""
@@ -734,6 +730,9 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
+            instantiate_kwargs = {}
+            if agent_name == "alfworld_opd":
+                instantiate_kwargs["env_manager"] = self.alfworld_env_manager
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
@@ -743,6 +742,7 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
+                **instantiate_kwargs,
             )
             run_kwargs = dict(kwargs)
             run_kwargs["validate"] = bool(trajectory["validate"])
@@ -1939,6 +1939,7 @@ class AgentLoopManager:
         llm_client: LLMServerClient,
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        alfworld_env_manager: Optional[ray.actor.ActorHandle] = None,
     ):
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
@@ -1946,6 +1947,7 @@ class AgentLoopManager:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.alfworld_env_manager = alfworld_env_manager
 
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
@@ -1977,20 +1979,25 @@ class AgentLoopManager:
                     self.llm_client,
                     self.teacher_client,
                     self.reward_loop_worker_handles,
+                    self.alfworld_env_manager,
                 )
             )
 
     def set_alfworld_resume_reset_count(self, reset_count: int) -> None:
         if self.config.actor_rollout_ref.rollout.agent.default_agent_loop != "alfworld_opd":
             return
-        if not getattr(self, "agent_loop_workers", None):
-            return
-        ray.get(
-            [
-                worker.set_alfworld_resume_reset_count.remote(int(reset_count))
-                for worker in self.agent_loop_workers
-            ]
-        )
+        if self.alfworld_env_manager is None:
+            raise RuntimeError("Central ALFWorld environment manager is unavailable")
+        ray.get(self.alfworld_env_manager.set_train_reset_count.remote(int(reset_count)))
+
+    def close(self) -> None:
+        """Stop agent-loop actors; TaskRunner separately owns the environment manager."""
+        for worker in getattr(self, "agent_loop_workers", []):
+            try:
+                ray.kill(worker, no_restart=True)
+            except Exception:
+                logger.debug("Ignoring agent-loop worker kill failure", exc_info=True)
+        self.agent_loop_workers = []
 
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:

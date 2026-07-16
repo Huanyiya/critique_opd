@@ -20,7 +20,6 @@ import logging
 import os
 import re
 import time
-import atexit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol
@@ -57,7 +56,6 @@ ALFWORLD_SPLIT_DIRS = {
     "eval_out_of_distribution": "valid_unseen",
 }
 _GAME_POOL_CACHE: dict[tuple[str, str], list[str]] = {}
-_ENV_MANAGER_CACHE: dict[tuple[Any, ...], "ALFWorldEnvManager"] = {}
 ALFWORLD_TEMPLATE_NO_HIS = """
 You are an expert agent operating in the ALFRED Embodied Environment.
 Your current observation is: {current_observation}
@@ -280,11 +278,6 @@ def _apply_alfworld_data_paths(config: dict[str, Any], data_root: Optional[str])
     dataset_config["eval_ood_data_path"] = str(_resolve_alfworld_split_dir(root, "eval_out_of_distribution"))
 
 
-def _sanitize_ray_name(value: str) -> str:
-    value = re.sub(r"[^0-9A-Za-z_\\-]+", "_", str(value)).strip("_")
-    return value or "alfworld_opd"
-
-
 class InstalledALFWorldEnvironment:
     """Adapter around the installed ``alfworld`` package's batch-size-one API."""
 
@@ -500,6 +493,14 @@ class ALFWorldEnvWorker:
             "alfworld_next_game_file": self._next_game_file,
         }
 
+    def ready(self) -> dict[str, int]:
+        """Report readiness after the persistent environment is initialized."""
+        return {
+            "worker_id": self.worker_id,
+            "group_id": self.group_id,
+            "rollout_id": self.rollout_id,
+        }
+
     def reset(self) -> tuple[str, dict[str, Any]]:
         reset_count = self.reset_count
         expected_game_file = self._next_game_file
@@ -558,9 +559,7 @@ class ALFWorldPersistentEnvironment:
 
 
 class ALFWorldEnvManager:
-    """Create and manage OPID-style persistent ALFWorld worker pools."""
-
-    RAY_NAMESPACE = "alfworld_opd_env"
+    """Centrally own the persistent train and validation ALFWorld actors."""
 
     def __init__(
         self,
@@ -575,7 +574,6 @@ class ALFWorldEnvManager:
         train_group_size: int,
         val_num_groups: int,
         val_group_size: int,
-        pool_name: Optional[str],
         env_worker_num_cpus: float,
     ):
         self.config_path = config_path
@@ -589,11 +587,11 @@ class ALFWorldEnvManager:
         self.val_num_groups = int(val_num_groups)
         self.val_group_size = int(val_group_size)
         self.env_worker_num_cpus = float(env_worker_num_cpus)
-        self.pool_name = _sanitize_ray_name(pool_name or "alfworld_opd")
         self._actor_cls = ray.remote(num_cpus=self.env_worker_num_cpus)(ALFWorldEnvWorker)
         self._actors: dict[tuple[str, int], ray.actor.ActorHandle] = {}
-        self._owned_actor_names: set[str] = set()
         self._base_envs: dict[tuple[str, str], Any] = {}
+        self._ready_pools: set[str] = set()
+        self._closed = False
         self.train_resume_reset_count = 0
 
         if self.train_num_groups <= 0 or self.train_group_size <= 0:
@@ -607,10 +605,11 @@ class ALFWorldEnvManager:
                 f"{self.val_num_groups} and {self.val_group_size}."
             )
 
-        # Match OPID: create the training environment pool up front. Validation
-        # workers are created lazily when validation actually runs.
+        # Match OPID's make_envs(): one owner creates both pools once during
+        # trainer initialization. Agent-loop workers only receive this manager's
+        # Ray handle and never create environment actors themselves.
         self._ensure_pool(validate=False)
-        atexit.register(self.close)
+        self._ensure_pool(validate=True)
 
     @staticmethod
     def _resolve_config_path(config_path: Optional[str]) -> Path:
@@ -658,15 +657,6 @@ class ALFWorldEnvManager:
             return "val", self.eval_split, self.seed + 1000, self.val_num_groups, self.val_group_size
         return "train", self.train_split, self.seed, self.train_num_groups, self.train_group_size
 
-    def _actor_name(self, pool_key: str, worker_id: int) -> str:
-        return f"{self.pool_name}_{pool_key}_{int(worker_id)}"
-
-    def _get_existing_actor(self, name: str) -> Optional[ray.actor.ActorHandle]:
-        try:
-            return ray.get_actor(name, namespace=self.RAY_NAMESPACE)
-        except ValueError:
-            return None
-
     def _get_or_create_actor(
         self,
         *,
@@ -681,34 +671,22 @@ class ALFWorldEnvManager:
         if cached is not None:
             return cached
 
-        actor_name = self._actor_name(pool_key, worker_id)
-        actor = self._get_existing_actor(actor_name)
-        if actor is not None:
-            self._actors[actor_key] = actor
-            return actor
-
         group_id = int(worker_id) // int(group_size)
         rollout_id = int(worker_id) % int(group_size)
         worker_seed = int(seed_base) + group_id
         base_env = self._build_base_env(split)
-        try:
-            actor = self._actor_cls.options(name=actor_name, namespace=self.RAY_NAMESPACE).remote(
-                config_path=self.config_path,
-                data_root=self.data_root,
-                split=split,
-                seed=worker_seed,
-                num_games=self.num_games,
-                base_env=base_env,
-                worker_id=worker_id,
-                group_id=group_id,
-                rollout_id=rollout_id,
-                resume_reset_count=self.train_resume_reset_count if pool_key == "train" else 0,
-            )
-            self._owned_actor_names.add(actor_name)
-        except ValueError:
-            actor = self._get_existing_actor(actor_name)
-            if actor is None:
-                raise
+        actor = self._actor_cls.remote(
+            config_path=self.config_path,
+            data_root=self.data_root,
+            split=split,
+            seed=worker_seed,
+            num_games=self.num_games,
+            base_env=base_env,
+            worker_id=worker_id,
+            group_id=group_id,
+            rollout_id=rollout_id,
+            resume_reset_count=self.train_resume_reset_count if pool_key == "train" else 0,
+        )
 
         self._actors[actor_key] = actor
         return actor
@@ -737,14 +715,23 @@ class ALFWorldEnvManager:
 
     def _ensure_pool(self, validate: bool) -> None:
         pool_key, split, seed_base, num_groups, group_size = self._pool_spec(validate)
+        if pool_key in self._ready_pools:
+            return
+        actors = []
         for worker_id in range(num_groups * group_size):
-            self._get_or_create_actor(
-                pool_key=pool_key,
-                split=split,
-                seed_base=seed_base,
-                group_size=group_size,
-                worker_id=worker_id,
+            actors.append(
+                self._get_or_create_actor(
+                    pool_key=pool_key,
+                    split=split,
+                    seed_base=seed_base,
+                    group_size=group_size,
+                    worker_id=worker_id,
+                )
             )
+        # Wait for all actor constructors once so initialization failures surface
+        # in TaskRunner before model training starts.
+        ray.get([actor.ready.remote() for actor in actors])
+        self._ready_pools.add(pool_key)
         logger.warning(
             "ALFWorld persistent %s pool ready: num_groups=%d group_size=%d total_workers=%d",
             pool_key,
@@ -753,7 +740,14 @@ class ALFWorldEnvManager:
             num_groups * group_size,
         )
 
-    def get_environment(self, *, validate: bool, sample_index: int, session_id: int) -> ALFWorldEnvironment:
+    def ready(self) -> dict[str, int]:
+        return {
+            "train_workers": self.train_num_groups * self.train_group_size,
+            "val_workers": self.val_num_groups * self.val_group_size,
+        }
+
+    def get_worker(self, *, validate: bool, sample_index: int, session_id: int) -> ray.actor.ActorHandle:
+        """Return the centrally owned worker assigned to one trajectory."""
         pool_key, split, seed_base, num_groups, group_size = self._pool_spec(validate)
         self._ensure_pool(validate=validate)
 
@@ -772,24 +766,30 @@ class ALFWorldEnvManager:
             group_size=group_size,
             worker_id=worker_id,
         )
-        return ALFWorldPersistentEnvironment(actor)
+        return actor
 
     def close(self) -> None:
-        if not ray.is_initialized():
+        if self._closed or not ray.is_initialized():
             return
-        for actor_name in list(self._owned_actor_names):
-            actor = self._get_existing_actor(actor_name)
-            if actor is None:
-                continue
+        self._closed = True
+        actors = list(self._actors.values())
+        if actors:
             try:
-                ray.get(actor.close.remote(), timeout=5)
+                ray.get([actor.close.remote() for actor in actors], timeout=30)
             except Exception:
-                logger.debug("Ignoring ALFWorld worker close failure for %s", actor_name, exc_info=True)
+                logger.warning("Some ALFWorld workers failed to close cleanly; killing the pool", exc_info=True)
+        for actor in actors:
             try:
                 ray.kill(actor, no_restart=True)
             except Exception:
-                logger.debug("Ignoring ALFWorld worker kill failure for %s", actor_name, exc_info=True)
-        self._owned_actor_names.clear()
+                logger.debug("Ignoring ALFWorld worker kill failure", exc_info=True)
+        self._actors.clear()
+        self._ready_pools.clear()
+        for base_env in self._base_envs.values():
+            close = getattr(base_env, "close", None)
+            if callable(close):
+                close()
+        self._base_envs.clear()
 
 
 def _config_get(config: Any, path: str, default: Any = None) -> Any:
@@ -804,114 +804,46 @@ def _config_get(config: Any, path: str, default: Any = None) -> Any:
     return current
 
 
-def _default_env_pool_name(config: Any) -> str:
-    project_name = _config_get(config, "trainer.project_name", "alfworld_opd")
-    experiment_name = _config_get(config, "trainer.experiment_name", "default")
-    return f"{project_name}_{experiment_name}"
+def create_alfworld_env_manager_actor_from_config(config: Any) -> Optional[ray.actor.ActorHandle]:
+    """Create the single TaskRunner-owned OPID-style environment manager."""
+    default_agent_loop = _config_get(config, "actor_rollout_ref.rollout.agent.default_agent_loop")
+    if default_agent_loop != "alfworld_opd":
+        return None
 
-
-def get_alfworld_env_manager(
-    *,
-    trainer_config: Any,
-    config_path: Optional[str],
-    data_root: Optional[str],
-    train_split: str,
-    eval_split: str,
-    seed: int,
-    num_games: Optional[int],
-    env_pool_name: Optional[str],
-    env_worker_num_cpus: float,
-) -> ALFWorldEnvManager:
-    train_num_groups = int(_config_get(trainer_config, "data.train_batch_size", 1))
-    val_num_groups = int(_config_get(trainer_config, "data.val_batch_size", train_num_groups) or train_num_groups)
-    train_group_size = int(_config_get(trainer_config, "actor_rollout_ref.rollout.n", 1) or 1)
-    val_group_size = int(_config_get(trainer_config, "actor_rollout_ref.rollout.val_kwargs.n", 1) or 1)
-    pool_name = env_pool_name or os.environ.get("ALFWORLD_ENV_POOL_NAME") or _default_env_pool_name(trainer_config)
-    cache_key = (
-        _sanitize_ray_name(pool_name),
-        str(config_path),
-        str(data_root),
-        train_split,
-        eval_split,
-        int(seed),
-        None if num_games is None else int(num_games),
-        train_num_groups,
-        train_group_size,
-        val_num_groups,
-        val_group_size,
-        float(env_worker_num_cpus),
+    seed = int(os.environ.get("ALFWORLD_SEED", "0"))
+    num_games_env = os.environ.get("ALFWORLD_NUM_GAMES")
+    num_games = (
+        int(num_games_env)
+        if num_games_env is not None and str(num_games_env).lower() not in {"", "none", "null"}
+        else None
     )
-    manager = _ENV_MANAGER_CACHE.get(cache_key)
-    if manager is None:
-        manager = ALFWorldEnvManager(
-            config_path=config_path,
-            data_root=data_root,
-            train_split=train_split,
-            eval_split=eval_split,
-            seed=int(seed),
-            num_games=num_games,
-            train_num_groups=train_num_groups,
-            train_group_size=train_group_size,
-            val_num_groups=val_num_groups,
-            val_group_size=val_group_size,
-            pool_name=pool_name,
-            env_worker_num_cpus=env_worker_num_cpus,
-        )
-        _ENV_MANAGER_CACHE[cache_key] = manager
+    train_num_groups = int(_config_get(config, "data.train_batch_size", 1))
+    val_num_groups = int(_config_get(config, "data.val_batch_size", train_num_groups) or train_num_groups)
+    train_group_size = int(_config_get(config, "actor_rollout_ref.rollout.n", 1) or 1)
+    val_group_size = int(_config_get(config, "actor_rollout_ref.rollout.val_kwargs.n", 1) or 1)
+    manager_cls = ray.remote(num_cpus=0)(ALFWorldEnvManager)
+    manager = manager_cls.remote(
+        config_path=os.environ.get("ALFWORLD_CONFIG_PATH"),
+        data_root=os.environ.get("ALFWORLD_DATA"),
+        train_split=os.environ.get("ALFWORLD_TRAIN_SPLIT", "train"),
+        eval_split=os.environ.get("ALFWORLD_EVAL_SPLIT", "eval_in_distribution"),
+        seed=seed,
+        num_games=num_games,
+        train_num_groups=train_num_groups,
+        train_group_size=train_group_size,
+        val_num_groups=val_num_groups,
+        val_group_size=val_group_size,
+        env_worker_num_cpus=float(os.environ.get("ALFWORLD_ENV_WORKER_NUM_CPUS", "0.1")),
+    )
+    # Waiting on a method guarantees that the manager constructor has created
+    # and initialized both the train and validation worker pools.
+    pool_sizes = ray.get(manager.ready.remote())
+    logger.warning(
+        "Central ALFWorld environment manager ready: train_workers=%d val_workers=%d",
+        pool_sizes["train_workers"],
+        pool_sizes["val_workers"],
+    )
     return manager
-
-
-def initialize_alfworld_env_manager_from_config(config: Any) -> None:
-    """Eagerly create the train ALFWorld env pool from the trainer config."""
-    default_agent_loop = _config_get(config, "actor_rollout_ref.rollout.agent.default_agent_loop")
-    if default_agent_loop != "alfworld_opd":
-        return
-
-    seed = int(os.environ.get("ALFWORLD_SEED", "0"))
-    num_games_env = os.environ.get("ALFWORLD_NUM_GAMES")
-    num_games = (
-        int(num_games_env)
-        if num_games_env is not None and str(num_games_env).lower() not in {"", "none", "null"}
-        else None
-    )
-    get_alfworld_env_manager(
-        trainer_config=config,
-        config_path=os.environ.get("ALFWORLD_CONFIG_PATH"),
-        data_root=os.environ.get("ALFWORLD_DATA"),
-        train_split=os.environ.get("ALFWORLD_TRAIN_SPLIT", "train"),
-        eval_split=os.environ.get("ALFWORLD_EVAL_SPLIT", "eval_in_distribution"),
-        seed=seed,
-        num_games=num_games,
-        env_pool_name=os.environ.get("ALFWORLD_ENV_POOL_NAME"),
-        env_worker_num_cpus=float(os.environ.get("ALFWORLD_ENV_WORKER_NUM_CPUS", "0.1")),
-    )
-
-
-def set_alfworld_env_resume_reset_count_from_config(config: Any, reset_count: int) -> None:
-    """Restore the persistent ALFWorld train pool cursor after checkpoint resume."""
-    default_agent_loop = _config_get(config, "actor_rollout_ref.rollout.agent.default_agent_loop")
-    if default_agent_loop != "alfworld_opd":
-        return
-
-    seed = int(os.environ.get("ALFWORLD_SEED", "0"))
-    num_games_env = os.environ.get("ALFWORLD_NUM_GAMES")
-    num_games = (
-        int(num_games_env)
-        if num_games_env is not None and str(num_games_env).lower() not in {"", "none", "null"}
-        else None
-    )
-    manager = get_alfworld_env_manager(
-        trainer_config=config,
-        config_path=os.environ.get("ALFWORLD_CONFIG_PATH"),
-        data_root=os.environ.get("ALFWORLD_DATA"),
-        train_split=os.environ.get("ALFWORLD_TRAIN_SPLIT", "train"),
-        eval_split=os.environ.get("ALFWORLD_EVAL_SPLIT", "eval_in_distribution"),
-        seed=seed,
-        num_games=num_games,
-        env_pool_name=os.environ.get("ALFWORLD_ENV_POOL_NAME"),
-        env_worker_num_cpus=float(os.environ.get("ALFWORLD_ENV_WORKER_NUM_CPUS", "0.1")),
-    )
-    manager.set_train_reset_count(int(reset_count))
 
 
 class InstalledALFWorldEnvironmentFactory:
@@ -951,7 +883,6 @@ class ALFWorldAgentLoop(AgentLoopBase):
         eval_split: str = "eval_in_distribution",
         seed: int = 0,
         num_games: Optional[int] = None,
-        env_pool_name: Optional[str] = None,
         env_worker_num_cpus: float = 0.1,
         max_steps: int = 30,
         history_length: int = 5,
@@ -961,6 +892,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
         teacher_critique_reject_log_path: Optional[str] = None,
         teacher_prompt_builder: Optional[TeacherPromptBuilder] = None,
         environment_factory: Optional[Any] = None,
+        env_manager: Optional[ray.actor.ActorHandle] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -970,11 +902,6 @@ class ALFWorldAgentLoop(AgentLoopBase):
         self.seed = int(seed)
         self.num_games = (
             int(num_games) if num_games is not None and str(num_games).lower() not in {"none", "null", ""} else None
-        )
-        self.env_pool_name = (
-            str(env_pool_name)
-            if env_pool_name is not None and str(env_pool_name).lower() not in {"", "none", "null"}
-            else None
         )
         self.env_worker_num_cpus = float(env_worker_num_cpus)
         self.max_steps = int(max_steps)
@@ -994,18 +921,11 @@ class ALFWorldAgentLoop(AgentLoopBase):
         self.response_length = int(self.rollout_config.response_length)
         self.teacher_prompt_builder = teacher_prompt_builder or ALFWorldCritiqueTeacherPromptBuilder()
         self.environment_factory = environment_factory
-        self.env_manager = None
-        if self.environment_factory is None:
-            self.env_manager = get_alfworld_env_manager(
-                trainer_config=self.config,
-                config_path=config_path,
-                data_root=self.data_root,
-                train_split=self.train_split,
-                eval_split=self.eval_split,
-                seed=self.seed,
-                num_games=self.num_games,
-                env_pool_name=self.env_pool_name,
-                env_worker_num_cpus=self.env_worker_num_cpus,
+        self.env_manager = env_manager
+        if self.environment_factory is None and self.env_manager is None:
+            raise ValueError(
+                "ALFWorldAgentLoop requires the TaskRunner-owned env_manager; "
+                "only tests may substitute environment_factory."
             )
         if self.max_steps <= 0:
             raise ValueError(f"max_steps must be positive, got {self.max_steps}.")
@@ -1052,11 +972,17 @@ class ALFWorldAgentLoop(AgentLoopBase):
         session_id = int(kwargs.get("session_id", extra_info.get("session_id", 0)) or 0)
         validate = bool(kwargs.get("validate", extra_info.get("validate", False)))
         if self.env_manager is not None:
-            environment = self.env_manager.get_environment(
-                validate=validate,
-                sample_index=sample_index,
-                session_id=session_id,
+            worker = await self.loop.run_in_executor(
+                None,
+                lambda: ray.get(
+                    self.env_manager.get_worker.remote(
+                        validate=validate,
+                        sample_index=sample_index,
+                        session_id=session_id,
+                    )
+                ),
             )
+            environment = ALFWorldPersistentEnvironment(worker)
         else:
             environment = self.environment_factory(split=split, seed=self.seed + sample_index)
 
