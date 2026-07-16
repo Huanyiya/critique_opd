@@ -9,7 +9,8 @@ TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH:-/mnt/cpfs/weights/Qwen3.5-9B}
 
 DATA_DIR=${DATA_DIR:-${HOME}/data/alfworld_opd}
 export ALFWORLD_DATA=${ALFWORLD_DATA:-/mnt/cpfs/datasets/alfworld}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3,4,5,6,7}
+export ALFWORLD_CONFIG_PATH=${ALFWORLD_CONFIG_PATH:-${ROOT_DIR}/examples/opd/alfworld/config_tw.yaml}
+
 OUTPUT_DIR=${OUTPUT_DIR:-${ROOT_DIR}/checkpoints/alfworld_opd}
 TRAIN_DATA_SIZE=${TRAIN_DATA_SIZE:-12}
 VAL_DATA_SIZE=${VAL_DATA_SIZE:-64}
@@ -20,21 +21,21 @@ MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-32768}
 
-STUDENT_GPUS_PER_NODE=${STUDENT_GPUS_PER_NODE:-4}
+STUDENT_GPUS_PER_NODE=${STUDENT_GPUS_PER_NODE:-6}
 TEACHER_GPUS_PER_NODE=${TEACHER_GPUS_PER_NODE:-2}
 NNODES=${NNODES:-1}
 STUDENT_TP=${STUDENT_TP:-1}
-TEACHER_TP=${TEACHER_TP:-2}
+TEACHER_TP=${TEACHER_TP:-1}
 AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-${TRAIN_DATA_SIZE}}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.7}
-TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.85}
+TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.7}
 
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 PROJECT_NAME=${PROJECT_NAME:-alfworld_opd}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen35_text_alfworld_opd}
 SAVE_FREQ=${SAVE_FREQ:-10}
 TEST_FREQ=${TEST_FREQ:-10}
-VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}
 
 export ALFWORLD_MAX_STEPS=${ALFWORLD_MAX_STEPS:-30}
 export ALFWORLD_HISTORY_LENGTH=${ALFWORLD_HISTORY_LENGTH:-5}
@@ -43,12 +44,14 @@ export ALFWORLD_ENV_WORKER_NUM_CPUS=${ALFWORLD_ENV_WORKER_NUM_CPUS:-0.1}
 export ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS=${ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS:-512}
 export ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE=${ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE:-0.1}
 export ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH=${ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH:-"${OUTPUT_DIR}/teacher_critique_rejects.txt"}
+export ALFWORLD_EVAL_SPLIT=${ALFWORLD_EVAL_SPLIT:-eval_out_of_distribution}
+
 
 PREPARE_DATA_ARGS=(
     --output-dir "${DATA_DIR}"
     --train-data-size "${TRAIN_DATA_SIZE}"
     --val-data-size "${VAL_DATA_SIZE}"
-    --eval-split "${ALFWORLD_EVAL_SPLIT:-eval_out_of_distribution}"
+    --eval-split "${ALFWORLD_EVAL_SPLIT}"
 )
 
 python3 "${ROOT_DIR}/examples/opd/alfworld/prepare_data.py" "${PREPARE_DATA_ARGS[@]}"
@@ -72,7 +75,7 @@ python3 -m verl.trainer.main_ppo_sync \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_DATA_SIZE}" \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.use_torch_compile=False \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
@@ -108,7 +111,7 @@ python3 -m verl.trainer.main_ppo_sync \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.n_gpus_per_node="${STUDENT_GPUS_PER_NODE}" \
     trainer.nnodes="${NNODES}" \
-    trainer.logger='[console]' \
+    trainer.logger='[console,wandb]' \
     trainer.default_local_dir="${OUTPUT_DIR}" \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
     trainer.save_freq="${SAVE_FREQ}" \

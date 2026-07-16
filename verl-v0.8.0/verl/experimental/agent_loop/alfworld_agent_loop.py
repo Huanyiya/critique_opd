@@ -350,7 +350,9 @@ class InstalledALFWorldEnvironment:
                 raise FileNotFoundError(f"ALFWorld config file does not exist: {resolved}")
             return resolved
 
+        repo_root = Path(__file__).resolve().parents[3]
         candidates = (
+            repo_root / "examples" / "opd" / "alfworld" / "config_tw.yaml",
             package_root / "configs" / "base_config.yaml",
             package_root.parent / "configs" / "base_config.yaml",
         )
@@ -358,8 +360,8 @@ class InstalledALFWorldEnvironment:
             if candidate.is_file():
                 return candidate
         raise FileNotFoundError(
-            "Could not locate ALFWorld's base_config.yaml. Set ALFWORLD_CONFIG_PATH to an official "
-            "text-world ALFWorld config file."
+            "Could not locate an ALFWorld config file. Set ALFWORLD_CONFIG_PATH to a valid text-world "
+            "ALFWorld YAML config."
         )
 
     def reset(self) -> tuple[str, dict[str, Any]]:
@@ -966,6 +968,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        rollout_started = time.perf_counter()
         extra_info = kwargs.get("extra_info", {}) or {}
         sample_index = int(kwargs.get("index", extra_info.get("index", 0)))
         split = self._resolve_split(extra_info)
@@ -1139,6 +1142,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
                     trajectory_uid=trajectory_uid,
                 )
                 teacher_critique_prompt_ids = await self._tokenize_teacher_messages(critique_messages)
+                teacher_critique_prompt_text = critique_messages[-1]["content"] if critique_messages else None
                 teacher_prompt_template = self.teacher_prompt_builder.build_scoring_prompt_template(
                     task_description=task_description,
                     initial_observation=initial_observation,
@@ -1152,6 +1156,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 # AgentLoopWorker, which excludes successful trajectories without
                 # invoking the teacher.
                 teacher_critique_prompt_ids = []
+                teacher_critique_prompt_text = None
                 teacher_prompt_template = None
 
             fallback_error_step = next(
@@ -1190,6 +1195,8 @@ class ALFWorldAgentLoop(AgentLoopBase):
             "environment_reward": environment_reward,
             "is_action_valid": [item["is_action_valid"] for item in history],
             "opd_eligible": opd_eligible,
+            "student_rollout_sec": time.perf_counter() - rollout_started,
+            "teacher_critique_prompt_text": teacher_critique_prompt_text,
         }
         return AgentLoopOutput(
             prompt_ids=student_prompt_ids,
@@ -1216,7 +1223,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
             if logprobs_available and len(summary_response_logprobs) == len(summary_response_ids)
             else None,
             reward_score=environment_reward,
-            num_turns=1 + 2 * len(history),
+            num_turns=len(history),
             metrics=metrics,
             extra_fields=extra_fields,
         )

@@ -211,12 +211,14 @@ def compute_reverse_kl_topk(
     student_topk_ids: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,
     teacher_topk_ids: torch.Tensor | None,
+    teacher_own_topk_log_probs: torch.Tensor | None,
     teacher_response_indices: torch.Tensor,
     data: TensorDict,
     config: DistillationConfig,
     data_format: str,
     unprivileged_teacher_topk_log_probs: torch.Tensor | None = None,
     unprivileged_teacher_topk_ids: torch.Tensor | None = None,
+    unprivileged_teacher_own_topk_log_probs: torch.Tensor | None = None,
     unprivileged_teacher_response_indices: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute reverse KL on rollout-time student top-k support.
@@ -247,6 +249,10 @@ def compute_reverse_kl_topk(
             "teacher_mass": zero.detach().clone(),
             "overlap_count": zero.detach().clone(),
             "overlap_token_advantage": zero.detach().clone(),
+            "js_student_teacher": zero.detach().clone(),
+            "topk_overlap_student_teacher": zero.detach().clone(),
+            "teacher_student_token_logprob": zero.detach().clone(),
+            "teacher_entropy_topk_normalized": zero.detach().clone(),
         }
 
     def _collect_teacher_rows(
@@ -254,9 +260,11 @@ def compute_reverse_kl_topk(
         topk_log_probs: torch.Tensor,
         response_indices: torch.Tensor,
         teacher_ids_for_overlap: torch.Tensor | None,
+        teacher_log_probs_for_overlap: torch.Tensor | None,
         *,
         expected_response_indices: list[torch.Tensor] | None = None,
     ) -> tuple[
+        torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
@@ -269,6 +277,9 @@ def compute_reverse_kl_topk(
         logprob_rows = topk_log_probs.unbind()
         index_rows = response_indices.unbind()
         teacher_overlap_rows = teacher_ids_for_overlap.unbind() if teacher_ids_for_overlap is not None else None
+        teacher_overlap_logprob_rows = (
+            teacher_log_probs_for_overlap.unbind() if teacher_log_probs_for_overlap is not None else None
+        )
         if not (len(id_rows) == len(logprob_rows) == len(index_rows) == prompt_lengths.numel()):
             raise ValueError(
                 "Sparse teacher batch size must match the student batch: "
@@ -280,18 +291,31 @@ def compute_reverse_kl_topk(
                 "Teacher top-k id batch size must match student top-k ids, got "
                 f"{len(teacher_overlap_rows)} and {len(id_rows)}."
             )
+        if teacher_overlap_logprob_rows is not None and len(teacher_overlap_logprob_rows) != len(id_rows):
+            raise ValueError(
+                "Teacher own top-k logprob batch size must match student top-k ids, got "
+                f"{len(teacher_overlap_logprob_rows)} and {len(id_rows)}."
+            )
 
         predictor_positions: list[torch.Tensor] = []
         selected_student_topk_ids: list[torch.Tensor] = []
         selected_teacher_topk_log_probs: list[torch.Tensor] = []
         selected_teacher_topk_ids: list[torch.Tensor] = []
+        selected_teacher_own_topk_log_probs: list[torch.Tensor] = []
         collected_indices: list[torch.Tensor] = []
-        for sample_idx, (sample_ids, sample_teacher, sample_indices, sample_teacher_ids) in enumerate(
+        for sample_idx, (
+            sample_ids,
+            sample_teacher,
+            sample_indices,
+            sample_teacher_ids,
+            sample_teacher_own_logprobs,
+        ) in enumerate(
             zip(
                 id_rows,
                 logprob_rows,
                 index_rows,
                 teacher_overlap_rows if teacher_overlap_rows is not None else [None] * len(id_rows),
+                teacher_overlap_logprob_rows if teacher_overlap_logprob_rows is not None else [None] * len(id_rows),
                 strict=True,
             )
         ):
@@ -304,6 +328,11 @@ def compute_reverse_kl_topk(
                 raise ValueError(
                     f"Sample {sample_idx} teacher top-k ids must match student ids shape, "
                     f"got {sample_teacher_ids.shape} and {sample_ids.shape}."
+                )
+            if sample_teacher_own_logprobs is not None and sample_teacher_own_logprobs.shape != sample_ids.shape:
+                raise ValueError(
+                    f"Sample {sample_idx} teacher own top-k logprobs must match student ids shape, "
+                    f"got {sample_teacher_own_logprobs.shape} and {sample_ids.shape}."
                 )
             if sample_teacher.shape[0] != sample_indices.numel():
                 raise ValueError(
@@ -338,15 +367,20 @@ def compute_reverse_kl_topk(
             selected_teacher_topk_log_probs.append(sample_teacher)
             if sample_teacher_ids is not None:
                 selected_teacher_topk_ids.append(sample_teacher_ids)
+            if sample_teacher_own_logprobs is not None:
+                selected_teacher_own_topk_log_probs.append(sample_teacher_own_logprobs)
 
         if not predictor_positions:
-            return None, None, None, None, collected_indices
+            return None, None, None, None, None, collected_indices
         return (
             torch.cat(predictor_positions).to(device=student_logits_flat.device, dtype=torch.int64),
             torch.cat(selected_student_topk_ids, dim=0).to(device=student_logits_flat.device, dtype=torch.int64),
             torch.cat(selected_teacher_topk_log_probs, dim=0).to(device=student_logits_flat.device).float(),
             torch.cat(selected_teacher_topk_ids, dim=0).to(device=student_logits_flat.device, dtype=torch.int64)
             if selected_teacher_topk_ids
+            else None,
+            torch.cat(selected_teacher_own_topk_log_probs, dim=0).to(device=student_logits_flat.device).float()
+            if selected_teacher_own_topk_log_probs
             else None,
             collected_indices,
         )
@@ -356,15 +390,21 @@ def compute_reverse_kl_topk(
         topk_log_probs: torch.Tensor,
         response_indices: torch.Tensor,
         teacher_ids_for_overlap: torch.Tensor | None,
+        teacher_log_probs_for_overlap: torch.Tensor | None,
         *,
         expected_response_indices: list[torch.Tensor] | None = None,
-        cached_support: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
+        cached_support: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        list[torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
         (
             predictor_positions,
             selected_student_topk_ids,
             selected_teacher_topk_log_probs,
             selected_teacher_topk_ids,
+            selected_teacher_own_topk_log_probs,
             collected_indices,
         ) = (
             _collect_teacher_rows(
@@ -372,6 +412,7 @@ def compute_reverse_kl_topk(
                 topk_log_probs,
                 response_indices,
                 teacher_ids_for_overlap,
+                teacher_log_probs_for_overlap,
                 expected_response_indices=expected_response_indices,
             )
         )
@@ -392,13 +433,20 @@ def compute_reverse_kl_topk(
                 dim=-1,
                 index=selected_student_topk_ids,
             )
+            selected_student_log_probs_for_metrics = selected_student_log_probs.detach()
             support = (
                 predictor_positions,
                 selected_student_topk_ids,
                 student_log_probs_on_topk,
+                selected_student_log_probs_for_metrics,
             )
         else:
-            predictor_positions, selected_student_topk_ids, student_log_probs_on_topk = cached_support
+            (
+                predictor_positions,
+                selected_student_topk_ids,
+                student_log_probs_on_topk,
+                selected_student_log_probs_for_metrics,
+            ) = cached_support
             support = cached_support
 
         if selected_teacher_topk_log_probs.shape != student_log_probs_on_topk.shape:
@@ -408,6 +456,7 @@ def compute_reverse_kl_topk(
             )
         student_mass = student_log_probs_on_topk.exp().sum(dim=-1)
         teacher_mass = selected_teacher_topk_log_probs.exp().sum(dim=-1)
+        raw_selected_teacher_topk_log_probs_for_metrics = selected_teacher_topk_log_probs.detach()
 
         if loss_config.log_prob_min_clamp is not None:
             student_log_probs_on_topk = student_log_probs_on_topk.clamp_min(loss_config.log_prob_min_clamp)
@@ -431,11 +480,13 @@ def compute_reverse_kl_topk(
         teacher_mass_out = torch.zeros_like(token_losses).index_copy(0, predictor_positions, teacher_mass)
         if selected_teacher_topk_ids is None:
             overlap_count = torch.full_like(selected_losses, float(selected_student_topk_ids.shape[-1]))
+            overlap_ratio = torch.ones_like(selected_losses)
         else:
             overlap_mask = (
                 selected_teacher_topk_ids.unsqueeze(-1) == selected_student_topk_ids.unsqueeze(-2)
             ).any(dim=-1)
             overlap_count = overlap_mask.sum(dim=-1).to(dtype=selected_losses.dtype)
+            overlap_ratio = overlap_count / float(selected_student_topk_ids.shape[-1])
         overlap_count_out = torch.zeros_like(token_losses).index_copy(
             0,
             predictor_positions,
@@ -447,12 +498,114 @@ def compute_reverse_kl_topk(
             predictor_positions,
             overlap_token_advantage,
         )
+
+        nan_template = torch.full_like(token_losses, float("nan")).detach()
+
+        def _scatter_diag(values: torch.Tensor) -> torch.Tensor:
+            return nan_template.clone().index_copy(0, predictor_positions, values.detach()).unsqueeze(0)
+
+        def _teacher_logprob_for_union_token(
+            token_id: torch.Tensor,
+            student_ids_row: torch.Tensor,
+            teacher_on_student_row: torch.Tensor,
+            teacher_ids_row: torch.Tensor,
+            teacher_own_row: torch.Tensor,
+        ) -> torch.Tensor:
+            student_match = student_ids_row == token_id
+            if bool(student_match.any()):
+                return teacher_on_student_row[student_match.nonzero(as_tuple=False)[0, 0]]
+            teacher_match = teacher_ids_row == token_id
+            if bool(teacher_match.any()):
+                return teacher_own_row[teacher_match.nonzero(as_tuple=False)[0, 0]]
+            raise RuntimeError("Union token id is not present in either student or teacher top-k support.")
+
+        with torch.no_grad():
+            actual_response_token_ids = data["input_ids"].values().index_select(0, predictor_positions + 1).to(
+                device=student_logits_flat.device,
+                dtype=torch.int64,
+            )
+            selected_teacher_log_probs_for_metrics = selected_teacher_topk_log_probs.detach()
+            selected_student_ids_for_metrics = selected_student_topk_ids.detach()
+            if selected_teacher_topk_ids is None or selected_teacher_own_topk_log_probs is None:
+                selected_teacher_ids_for_metrics = selected_student_ids_for_metrics
+                selected_teacher_own_log_probs_for_metrics = raw_selected_teacher_topk_log_probs_for_metrics
+            else:
+                selected_teacher_ids_for_metrics = selected_teacher_topk_ids.detach()
+                selected_teacher_own_log_probs_for_metrics = selected_teacher_own_topk_log_probs.detach()
+            selected_teacher_log_probs_for_metrics = raw_selected_teacher_topk_log_probs_for_metrics
+
+            js_values: list[torch.Tensor] = []
+            selected_token_teacher_log_probs: list[torch.Tensor] = []
+            for row_idx in range(selected_student_ids_for_metrics.shape[0]):
+                student_ids_row = selected_student_ids_for_metrics[row_idx]
+                teacher_ids_row = selected_teacher_ids_for_metrics[row_idx]
+                union_ids = torch.unique(torch.cat([student_ids_row, teacher_ids_row], dim=0))
+                student_union_log_probs = selected_student_log_probs_for_metrics[row_idx].index_select(
+                    dim=0, index=union_ids
+                )
+                teacher_union_log_probs = torch.stack(
+                    [
+                        _teacher_logprob_for_union_token(
+                            token_id,
+                            student_ids_row,
+                            selected_teacher_log_probs_for_metrics[row_idx],
+                            teacher_ids_row,
+                            selected_teacher_own_log_probs_for_metrics[row_idx],
+                        )
+                        for token_id in union_ids
+                    ]
+                )
+                student_union_log_probs = student_union_log_probs - torch.logsumexp(
+                    student_union_log_probs, dim=-1
+                )
+                teacher_union_log_probs = teacher_union_log_probs - torch.logsumexp(
+                    teacher_union_log_probs, dim=-1
+                )
+                mixed_log_probs = torch.logaddexp(student_union_log_probs, teacher_union_log_probs) - torch.log(
+                    torch.tensor(2.0, device=student_union_log_probs.device, dtype=student_union_log_probs.dtype)
+                )
+                student_probs = student_union_log_probs.exp()
+                teacher_probs = teacher_union_log_probs.exp()
+                js_values.append(
+                    0.5
+                    * (
+                        (student_probs * (student_union_log_probs - mixed_log_probs)).sum()
+                        + (teacher_probs * (teacher_union_log_probs - mixed_log_probs)).sum()
+                    )
+                )
+
+                actual_token_id = actual_response_token_ids[row_idx]
+                actual_match = student_ids_row == actual_token_id
+                if bool(actual_match.any()):
+                    selected_token_teacher_log_probs.append(
+                        selected_teacher_log_probs_for_metrics[row_idx][actual_match.nonzero(as_tuple=False)[0, 0]]
+                    )
+                else:
+                    selected_token_teacher_log_probs.append(
+                        torch.full((), float("nan"), device=student_logits_flat.device)
+                    )
+
+            js_student_teacher = torch.stack(js_values).to(dtype=selected_losses.dtype)
+            teacher_student_token_logprob = torch.stack(selected_token_teacher_log_probs).to(
+                dtype=selected_losses.dtype
+            )
+            teacher_own_log_probs_normalized = selected_teacher_own_log_probs_for_metrics - torch.logsumexp(
+                selected_teacher_own_log_probs_for_metrics, dim=-1, keepdim=True
+            )
+            teacher_entropy_topk_normalized = -(
+                teacher_own_log_probs_normalized.exp() * teacher_own_log_probs_normalized
+            ).sum(dim=-1)
+
         return {
             "distillation_losses": token_losses.unsqueeze(0),
             "student_mass": student_mass_out.unsqueeze(0),
             "teacher_mass": teacher_mass_out.unsqueeze(0),
             "overlap_count": overlap_count_out.unsqueeze(0),
             "overlap_token_advantage": overlap_token_advantage_out.unsqueeze(0),
+            "js_student_teacher": _scatter_diag(js_student_teacher),
+            "topk_overlap_student_teacher": _scatter_diag(overlap_ratio),
+            "teacher_student_token_logprob": _scatter_diag(teacher_student_token_logprob),
+            "teacher_entropy_topk_normalized": _scatter_diag(teacher_entropy_topk_normalized),
         }, collected_indices, support
 
     outputs, expected_indices, cached_support = _compute_on_student_support(
@@ -460,17 +613,21 @@ def compute_reverse_kl_topk(
         teacher_topk_log_probs,
         teacher_response_indices,
         teacher_topk_ids,
+        teacher_own_topk_log_probs,
     )
     if (unprivileged_teacher_topk_log_probs is None) != (unprivileged_teacher_response_indices is None):
         raise ValueError("Unprivileged teacher top-k log probabilities and response indices must be provided together.")
     if unprivileged_teacher_topk_ids is not None and unprivileged_teacher_topk_log_probs is None:
         raise ValueError("Unprivileged teacher top-k ids require unprivileged teacher top-k log probabilities.")
+    if unprivileged_teacher_own_topk_log_probs is not None and unprivileged_teacher_topk_ids is None:
+        raise ValueError("Unprivileged teacher own top-k logprobs require unprivileged teacher top-k ids.")
     if unprivileged_teacher_topk_log_probs is not None and unprivileged_teacher_response_indices is not None:
         unprivileged_outputs, _, _ = _compute_on_student_support(
             student_topk_ids,
             unprivileged_teacher_topk_log_probs,
             unprivileged_teacher_response_indices,
             unprivileged_teacher_topk_ids,
+            unprivileged_teacher_own_topk_log_probs,
             expected_response_indices=expected_indices,
             cached_support=cached_support,
         )

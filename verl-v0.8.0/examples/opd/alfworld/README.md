@@ -52,12 +52,10 @@ alfworld-download -f
 export ALFWORLD_DATA="$HOME/.cache/alfworld"
 ```
 
-The loop searches the installed package for `configs/base_config.yaml`. If the
-package does not ship that file, point to the official config explicitly:
-
-```bash
-export ALFWORLD_CONFIG_PATH=/path/to/ALFWorld/configs/base_config.yaml
-```
+The launcher now defaults `ALFWORLD_CONFIG_PATH` to the bundled
+`examples/opd/alfworld/config_tw.yaml`, which keeps only the text-world fields
+that this rollout path actually uses. You can still override it explicitly if
+needed.
 
 No OPID-bundled veRL, trainer, advantage estimator, GiGPO code, analyzer, or
 skill prompt is required.

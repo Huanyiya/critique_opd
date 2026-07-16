@@ -20,6 +20,7 @@ from tensordict import TensorDict
 
 from verl.base_config import BaseConfig
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
@@ -123,6 +124,145 @@ def compute_distillation_loss_range(
     }
 
 
+def _as_batch_list(value: Any, batch_size: int, default: Any = None) -> list[Any]:
+    """Normalize TensorDict non-tensor values to a per-sample Python list."""
+    if value is None:
+        return [default for _ in range(batch_size)]
+    if isinstance(value, torch.Tensor):
+        if value.numel() == batch_size:
+            return value.detach().cpu().tolist()
+        if value.numel() == 1:
+            scalar = value.detach().cpu().item()
+            return [scalar for _ in range(batch_size)]
+        return [default for _ in range(batch_size)]
+    if hasattr(value, "tolist"):
+        try:
+            value = value.tolist()
+        except Exception:
+            pass
+    if isinstance(value, tuple):
+        value = list(value)
+    if isinstance(value, list):
+        if len(value) == batch_size:
+            return value
+        if len(value) == 1:
+            return value * batch_size
+        return [default for _ in range(batch_size)]
+    return [value for _ in range(batch_size)]
+
+
+def _scalar(value: Any, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return default
+        return value.detach().cpu().flatten()[0].item()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            return value
+    return value
+
+
+def _truthy(value: Any) -> bool:
+    value = _scalar(value, False)
+    return bool(value)
+
+
+def _batch_metadata(data: TensorDict, batch_size: int) -> list[dict[str, Any]]:
+    """Read ALFWorld OPD metadata from either TQ extra_fields or normal non-tensor fields."""
+    extra_fields = tu.get(data, "extra_fields", None)
+    extra_fields_list = _as_batch_list(extra_fields, batch_size, default={})
+    if any(isinstance(item, dict) and item for item in extra_fields_list):
+        return [item if isinstance(item, dict) else {} for item in extra_fields_list]
+
+    metadata: list[dict[str, Any]] = [dict() for _ in range(batch_size)]
+    for key in (
+        "trajectory_uid",
+        "task_uid",
+        "opd_selected",
+        "opd_step_index",
+        "opd_error_step",
+        "opd_skip_reason",
+        "teacher_critique_parse_ok",
+        "environment_reward",
+        "trajectory_steps",
+        "termination_reason",
+    ):
+        values = _as_batch_list(tu.get(data, key, None), batch_size, default=None)
+        for idx, value in enumerate(values):
+            metadata[idx][key] = value
+    return metadata
+
+
+def _trajectory_metric_mean(
+    token_metric: torch.Tensor | None,
+    response_mask_bool: torch.Tensor,
+    metadata: list[dict[str, Any]],
+    *,
+    scope: str,
+) -> tuple[torch.Tensor | None, int]:
+    """Aggregate token metrics by trajectory first, then average trajectories."""
+    if token_metric is None:
+        return None, 0
+    if token_metric.shape != response_mask_bool.shape:
+        raise ValueError(f"Token metric shape {token_metric.shape} does not match response mask {response_mask_bool.shape}.")
+
+    groups: dict[str, list[torch.Tensor]] = {}
+    for sample_idx, meta in enumerate(metadata):
+        if not _truthy(meta.get("opd_selected")):
+            continue
+        step_index = _scalar(meta.get("opd_step_index"), None)
+        error_step = _scalar(meta.get("opd_error_step"), None)
+        if step_index is None or error_step is None:
+            continue
+        if scope == "error_action" and int(step_index) != int(error_step):
+            continue
+        sample_metric = token_metric[sample_idx]
+        finite_mask = torch.isfinite(sample_metric)
+        sample_mask = response_mask_bool[sample_idx] & finite_mask
+        if not bool(sample_mask.any()):
+            continue
+        trajectory_uid = meta.get("trajectory_uid") or f"sample-{sample_idx}"
+        groups.setdefault(str(trajectory_uid), []).append(sample_metric[sample_mask].detach())
+
+    trajectory_means = [torch.cat(values).mean() for values in groups.values() if values]
+    if not trajectory_means:
+        return None, 0
+    return torch.stack(trajectory_means).mean(), len(trajectory_means)
+
+
+def _add_scoped_token_metrics(
+    metrics: dict[str, Any],
+    *,
+    name: str,
+    token_metric: torch.Tensor | None,
+    response_mask_bool: torch.Tensor,
+    metadata: list[dict[str, Any]],
+) -> None:
+    for scope in ("prefix_to_error", "error_action"):
+        value, _ = _trajectory_metric_mean(
+            token_metric,
+            response_mask_bool,
+            metadata,
+            scope=scope,
+        )
+        if value is not None:
+            metrics[f"{name}_{scope}"] = value.detach().item()
+
+
+def _opd_valid_trajectory_count(response_mask_bool: torch.Tensor, metadata: list[dict[str, Any]]) -> int:
+    valid_uids: set[str] = set()
+    for sample_idx, meta in enumerate(metadata):
+        if not _truthy(meta.get("opd_selected")):
+            continue
+        if bool(response_mask_bool[sample_idx].any()):
+            valid_uids.add(str(meta.get("trajectory_uid") or f"sample-{sample_idx}"))
+    return len(valid_uids)
+
+
 def compute_topk_loss(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -165,9 +305,13 @@ def compute_topk_loss(
                     student_topk_ids=data["student_topk_ids"],
                     teacher_topk_log_probs=data["teacher_topk_logprobs"],
                     teacher_topk_ids=data.get("teacher_topk_ids"),
+                    teacher_own_topk_log_probs=data.get("teacher_own_topk_logprobs"),
                     teacher_response_indices=data["teacher_response_indices"],
                     unprivileged_teacher_topk_log_probs=data.get("unprivileged_teacher_topk_logprobs"),
                     unprivileged_teacher_topk_ids=data.get("unprivileged_teacher_topk_ids"),
+                    unprivileged_teacher_own_topk_log_probs=data.get(
+                        "unprivileged_teacher_own_topk_logprobs"
+                    ),
                     unprivileged_teacher_response_indices=data.get("unprivileged_teacher_response_indices"),
                     data=data,
                     config=distillation_config,
@@ -275,6 +419,7 @@ def distillation_ppo_loss(
     )
     policy_loss += distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
+    policy_metrics["train/opd_loss"] = Metric(value=distill_loss.detach(), aggregation=AggregationType.SUM)
 
     return policy_loss, policy_metrics
 
@@ -377,6 +522,7 @@ def compute_forward_kl_topk(
     else:
         response_mask_bool = data["response_mask"].bool()
     assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+    metadata = _batch_metadata(data, batch_size=response_mask_bool.shape[0])
 
     overlap_metrics = {}
     if overlap_count is not None and overlap_token_advantage is not None:
@@ -396,6 +542,136 @@ def compute_forward_kl_topk(
         else:
             overlap_metrics["distillation/overlap_token_advantage"] = 0.0
 
+    def _padded_optional(name: str) -> torch.Tensor | None:
+        value = model_output.get(name)
+        if value is None:
+            return None
+        return no_padding_2_padding(value, data)
+
+    critique_js = _padded_optional("js_student_teacher")
+    base_js = _padded_optional("unprivileged_js_student_teacher")
+    critique_overlap = _padded_optional("topk_overlap_student_teacher")
+    base_overlap = _padded_optional("unprivileged_topk_overlap_student_teacher")
+    critique_token_logprob = _padded_optional("teacher_student_token_logprob")
+    base_token_logprob = _padded_optional("unprivileged_teacher_student_token_logprob")
+    critique_entropy = _padded_optional("teacher_entropy_topk_normalized")
+    base_entropy = _padded_optional("unprivileged_teacher_entropy_topk_normalized")
+
+    md_metrics: dict[str, Any] = {
+        "train/opd_valid_token_count": Metric(
+            AggregationType.SUM,
+            response_mask_bool.sum().detach().to(dtype=torch.float32),
+        ),
+        "train/opd_valid_trajectory_count": Metric(
+            AggregationType.SUM,
+            torch.tensor(
+                float(_opd_valid_trajectory_count(response_mask_bool, metadata)),
+                device=response_mask_bool.device,
+            ),
+        ),
+    }
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="distribution/js_student_base",
+        token_metric=base_js,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="distribution/js_student_critique",
+        token_metric=critique_js,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    if critique_js is not None and base_js is not None:
+        _add_scoped_token_metrics(
+            md_metrics,
+            name="distribution/js_critique_effect",
+            token_metric=critique_js - base_js,
+            response_mask_bool=response_mask_bool,
+            metadata=metadata,
+        )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="distribution/topk_overlap_student_base",
+        token_metric=base_overlap,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="distribution/topk_overlap_student_critique",
+        token_metric=critique_overlap,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    if critique_overlap is not None and base_overlap is not None:
+        _add_scoped_token_metrics(
+            md_metrics,
+            name="distribution/topk_overlap_critique_effect",
+            token_metric=critique_overlap - base_overlap,
+            response_mask_bool=response_mask_bool,
+            metadata=metadata,
+        )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="teacher/student_token_logprob_base",
+        token_metric=base_token_logprob,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="teacher/student_token_logprob_critique",
+        token_metric=critique_token_logprob,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    if critique_token_logprob is not None and base_token_logprob is not None:
+        _add_scoped_token_metrics(
+            md_metrics,
+            name="teacher/student_token_logprob_critique_minus_base",
+            token_metric=critique_token_logprob - base_token_logprob,
+            response_mask_bool=response_mask_bool,
+            metadata=metadata,
+        )
+        _add_scoped_token_metrics(
+            md_metrics,
+            name="teacher/student_token_prob_critique_minus_base",
+            token_metric=critique_token_logprob.exp() - base_token_logprob.exp(),
+            response_mask_bool=response_mask_bool,
+            metadata=metadata,
+        )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="teacher/student_token_prob_base",
+        token_metric=base_token_logprob.exp() if base_token_logprob is not None else None,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="teacher/student_token_prob_critique",
+        token_metric=critique_token_logprob.exp() if critique_token_logprob is not None else None,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="teacher/entropy_topk_normalized_base",
+        token_metric=base_entropy,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+    _add_scoped_token_metrics(
+        md_metrics,
+        name="teacher/entropy_topk_normalized_critique",
+        token_metric=critique_entropy,
+        response_mask_bool=response_mask_bool,
+        metadata=metadata,
+    )
+
     # Log amount of mass in the top-k log probabilities for both student and teacher.
     student_mass = student_mass[response_mask_bool]
     teacher_mass = teacher_mass[response_mask_bool]
@@ -407,6 +683,7 @@ def compute_forward_kl_topk(
         "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass.min()),
         "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass.max()),
         **overlap_metrics,
+        **md_metrics,
     }
 
     # This guards normalized reverse KL against tiny negative roundoff and

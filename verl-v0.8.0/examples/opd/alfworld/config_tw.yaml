@@ -1,0 +1,33 @@
+dataset:
+  # These paths are overwritten from ALFWORLD_DATA at runtime.
+  data_path: "$ALFWORLD_DATA/json_2.1.1/train"
+  eval_id_data_path: "$ALFWORLD_DATA/json_2.1.1/valid_seen"
+  eval_ood_data_path: "$ALFWORLD_DATA/json_2.1.1/valid_unseen"
+  # <= 0 means use the full discovered game pool.
+  num_train_games: -1
+  num_eval_games: -1
+
+env:
+  # We always run the text-only TextWorld backend.
+  type: "AlfredTWEnv"
+  # Keep object naming deterministic.
+  domain_randomization: false
+  # Same supported ALFWorld task families as OPID.
+  task_types: [1, 2, 3, 4, 5, 6]
+  # Needed only when the official env adds an expert wrapper on train split.
+  expert_type: "handcoded"
+  # Keep templated goal descriptions.
+  goal_desc_human_anns_prob: 0.0
+
+general:
+  # The rollout worker seed comes from the manager, not this field.
+  random_seed: 42
+  # Forced to false at runtime because env workers are CPU-only.
+  use_cuda: true
+  # Required by AlfredTWEnv.init_env() to select the dagger branch.
+  training_method: "dagger"
+
+dagger:
+  training:
+    # Official TextWorld env episode cap.
+    max_nb_steps_per_episode: 50

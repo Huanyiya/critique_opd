@@ -454,6 +454,7 @@ def extract_prompt_selected_logprobs(
     selected_ids: list[list[int]] = []
     selected_logprobs: list[list[float]] = []
     teacher_topk_ids: list[list[int]] = []
+    teacher_topk_logprobs: list[list[float]] = []
     for position, row_token_ids in zip(positions, token_ids, strict=True):
         if position < 0 or position >= len(prompt_rows):
             raise ValueError(
@@ -461,7 +462,18 @@ def extract_prompt_selected_logprobs(
             )
         logprobs_dict = prompt_rows[position]
         row_ids = [int(token_id) for token_id in row_token_ids]
-        teacher_topk_ids.append(_topk_ids_from_logprobs_dict(logprobs_dict, len(row_ids)))
+        row_teacher_topk_ids = _topk_ids_from_logprobs_dict(logprobs_dict, len(row_ids))
+        row_teacher_topk_logprobs: list[float] = []
+        for token_id in row_teacher_topk_ids:
+            token_logprob = _lookup_logprob_entry(logprobs_dict, token_id)
+            if token_logprob is None:
+                raise ValueError(
+                    "vLLM did not return a teacher top-k prompt token id. "
+                    f"missing token_id={token_id} at position={position}."
+                )
+            row_teacher_topk_logprobs.append(float(token_logprob.logprob))
+        teacher_topk_ids.append(row_teacher_topk_ids)
+        teacher_topk_logprobs.append(row_teacher_topk_logprobs)
         row_logprobs: list[float] = []
         for token_id in row_ids:
             token_logprob = _lookup_logprob_entry(logprobs_dict, token_id)
@@ -479,6 +491,7 @@ def extract_prompt_selected_logprobs(
     result_dict["prompt_selected_ids"] = selected_ids
     result_dict["prompt_selected_logprobs"] = selected_logprobs
     result_dict["prompt_teacher_topk_ids"] = teacher_topk_ids
+    result_dict["prompt_teacher_topk_logprobs"] = teacher_topk_logprobs
 
 
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):

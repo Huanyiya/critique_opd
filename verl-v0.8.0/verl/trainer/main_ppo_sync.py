@@ -112,6 +112,185 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["temperature"] = 0
 
 
+def _safe_scalar(value: Any, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return default
+        return value.detach().cpu().flatten()[0].item()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            return value
+    return value
+
+
+def _safe_bool(value: Any) -> bool:
+    return bool(_safe_scalar(value, False))
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    finite_values = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    if not finite_values:
+        return None
+    return float(np.mean(finite_values))
+
+
+def _extract_extra_fields_list(extra_fields: Any) -> list[dict[str, Any]]:
+    if extra_fields is None:
+        return []
+    if hasattr(extra_fields, "tolist"):
+        extra_fields = extra_fields.tolist()
+    if isinstance(extra_fields, dict):
+        return [extra_fields]
+    if isinstance(extra_fields, tuple):
+        extra_fields = list(extra_fields)
+    if not isinstance(extra_fields, list):
+        return []
+    return [item if isinstance(item, dict) else {} for item in extra_fields]
+
+
+def _batch_has_any_response_tokens(batch: KVBatchMeta) -> bool:
+    mask_data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["response_mask"])
+    response_mask = mask_data["response_mask"]
+    response_mask_values = response_mask.values() if response_mask.is_nested else response_mask
+    return bool(response_mask_values.bool().any())
+
+
+def _compute_alfworld_rollout_metrics(extra_fields: list[dict[str, Any]], timing_raw: dict) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    by_trajectory: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for idx, extra_field in enumerate(extra_fields):
+        trajectory_uid = extra_field.get("trajectory_uid") or f"sample-{idx}"
+        by_trajectory[str(trajectory_uid)].append(extra_field)
+
+    if not by_trajectory:
+        return metrics
+
+    success_count = 0
+    failed_count = 0
+    step_counts: list[float] = []
+    success_step_counts: list[float] = []
+    failed_step_counts: list[float] = []
+    valid_error_steps: list[float] = []
+    critique_denominator = 0
+    critique_parse_failures = 0
+    student_rollout_times: list[float] = []
+    critique_analysis_times: list[float] = []
+    critique_scoring_by_trajectory: list[float] = []
+    base_scoring_by_trajectory: list[float] = []
+
+    for records in by_trajectory.values():
+        representative = records[-1]
+        for record in records:
+            if record.get("trajectory_steps"):
+                representative = record
+                break
+
+        trajectory_steps = representative.get("trajectory_steps") or []
+        num_steps = len(trajectory_steps) if isinstance(trajectory_steps, list) else None
+        if num_steps is not None:
+            step_counts.append(float(num_steps))
+
+        environment_reward = _safe_scalar(representative.get("environment_reward"), 0.0)
+        success = bool(environment_reward and float(environment_reward) > 0.0) or representative.get(
+            "termination_reason"
+        ) == "success"
+        if success:
+            success_count += 1
+            if num_steps is not None:
+                success_step_counts.append(float(num_steps))
+        else:
+            failed_count += 1
+            if num_steps is not None:
+                failed_step_counts.append(float(num_steps))
+
+        parse_ok_seen = any(record.get("teacher_critique_parse_ok") is not None for record in records)
+        skip_reasons = {record.get("opd_skip_reason") for record in records}
+        called_teacher_for_critique = (not success) and (
+            parse_ok_seen
+            or "teacher_critique_parse_failed" in skip_reasons
+            or "teacher_critique_low_confidence" in skip_reasons
+            or any(record.get("teacher_critique") for record in records)
+        )
+        if called_teacher_for_critique:
+            critique_denominator += 1
+            parse_failed = any(record.get("teacher_critique_parse_ok") is False for record in records) or (
+                "teacher_critique_parse_failed" in skip_reasons
+            )
+            if parse_failed:
+                critique_parse_failures += 1
+
+        selected_records = [record for record in records if _safe_bool(record.get("opd_selected"))]
+        if selected_records:
+            error_step = _safe_scalar(selected_records[0].get("opd_error_step"), None)
+            if error_step is not None:
+                valid_error_steps.append(float(error_step) + 1.0)
+
+        student_rollout_time = _mean_or_none(
+            [
+                float(value)
+                for value in (_safe_scalar(record.get("student_rollout_sec"), None) for record in records)
+                if value is not None
+            ]
+        )
+        if student_rollout_time is not None:
+            student_rollout_times.append(student_rollout_time)
+        critique_analysis_values = []
+        for record in records:
+            value = _safe_scalar(record.get("teacher_error_analysis_sec"), None)
+            if value is not None:
+                critique_analysis_values.append(float(value))
+        critique_analysis_time = _mean_or_none(critique_analysis_values)
+        if critique_analysis_time is not None:
+            critique_analysis_times.append(critique_analysis_time)
+        critique_scoring_sum = sum(
+            float(record.get("critique_teacher_scoring_sec", 0.0) or 0.0) for record in records
+        )
+        base_scoring_sum = sum(float(record.get("base_teacher_scoring_sec", 0.0) or 0.0) for record in records)
+        if critique_scoring_sum > 0.0:
+            critique_scoring_by_trajectory.append(critique_scoring_sum)
+        if base_scoring_sum > 0.0:
+            base_scoring_by_trajectory.append(base_scoring_sum)
+
+    total_trajectories = success_count + failed_count
+    if total_trajectories > 0:
+        metrics["train_step/trajectory_accuracy"] = success_count / total_trajectories
+        metrics["train_step/success_trajectory_count"] = float(success_count)
+        metrics["train_step/failed_trajectory_count"] = float(failed_count)
+        metrics["eval/train_accuracy"] = success_count / total_trajectories
+        metrics["eval/train_num_tasks"] = float(total_trajectories)
+    if valid_error_steps:
+        metrics["train_step/error_step_mean"] = float(np.mean(valid_error_steps))
+    if critique_denominator > 0:
+        metrics["critique/parse_failure_ratio"] = critique_parse_failures / critique_denominator
+    if step_counts:
+        metrics["rollout/steps_min"] = float(np.min(step_counts))
+        metrics["rollout/steps_max"] = float(np.max(step_counts))
+        metrics["rollout/steps_mean"] = float(np.mean(step_counts))
+    success_steps_mean = _mean_or_none(success_step_counts)
+    failed_steps_mean = _mean_or_none(failed_step_counts)
+    if success_steps_mean is not None:
+        metrics["rollout/success_steps_mean"] = success_steps_mean
+    if failed_steps_mean is not None:
+        metrics["rollout/failed_steps_mean"] = failed_steps_mean
+    if student_rollout_times:
+        metrics["time/student_rollout_sec"] = float(np.max(student_rollout_times))
+    if "step" in timing_raw:
+        metrics["time/train_step_total_sec"] = float(timing_raw["step"])
+    if "testing" in timing_raw:
+        metrics["time/evaluation_sec"] = float(timing_raw["testing"])
+    if critique_analysis_times:
+        metrics["time/teacher_error_analysis_sec"] = float(np.max(critique_analysis_times))
+    if critique_scoring_by_trajectory:
+        metrics["time/critique_teacher_scoring_sec"] = float(np.max(critique_scoring_by_trajectory))
+    if base_scoring_by_trajectory:
+        metrics["time/base_teacher_scoring_sec"] = float(np.max(base_scoring_by_trajectory))
+    return metrics
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
@@ -1207,9 +1386,20 @@ class PPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
+    def _val_metrics_update(
+        self,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        sample_turns,
+    ) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
+        rewards = reward_extra_infos_dict.get("reward", [])
+        if rewards:
+            reward_array = np.array([float(reward) for reward in rewards], dtype=np.float32)
+            metric_dict["eval/test_accuracy"] = float((reward_array > 0.0).mean())
+            metric_dict["eval/test_num_tasks"] = float(reward_array.size)
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
@@ -1607,6 +1797,9 @@ class PPOTrainer:
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
+        for key, value in actor_metrics.items():
+            if key.startswith(("actor/distribution/", "actor/teacher/", "actor/train/")):
+                metrics[key[len("actor/") :]] = value
 
         return batch
 
@@ -1629,20 +1822,23 @@ class PPOTrainer:
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
+        extra_fields_data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["extra_fields"],
+        )
+        extra_fields_list = _extract_extra_fields_list(extra_fields_data.get("extra_fields"))
+        metric_extra_fields = [
+            extra_field for extra_field, keep in zip(extra_fields_list, non_padding_mask, strict=False) if keep
+        ]
 
         # Only fetch speculative decoding stats when rollout writes them.
         spec_drafts = spec_accepts = spec_verifies = None
         mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
         if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
-            spec_data = tq.kv_batch_get(
-                keys=batch.keys,
-                partition_id=batch.partition_id,
-                select_fields=["extra_fields"],
-            )
-            extra_fields = spec_data["extra_fields"].tolist()
-            spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields]
-            spec_accepts = [extra_field["spec_num_accepted_tokens"] for extra_field in extra_fields]
-            spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
+            spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields_list]
+            spec_accepts = [extra_field["spec_num_accepted_tokens"] for extra_field in extra_fields_list]
+            spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields_list]
 
         data = data.to_padded_tensor()
         data["token_level_scores"] = data["rm_scores"]
@@ -1657,6 +1853,7 @@ class PPOTrainer:
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+        metrics.update(_compute_alfworld_rollout_metrics(metric_extra_fields, timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
         gradient_norm = metrics.get("actor/grad_norm", None)
@@ -1813,6 +2010,13 @@ class PPOTrainer:
 
         # 4. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
+
+        if is_distillation_enabled(self.config.get("distillation")) and not _batch_has_any_response_tokens(batch):
+            # In critique-conditioned OPD, a whole batch can legitimately contain
+            # no trainable tokens when every trajectory is successful or rejected
+            # by teacher critique parsing / confidence filtering.
+            metrics["opd/skipped_empty_error_batch"] = 1.0
+            return batch
 
         # 5. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):

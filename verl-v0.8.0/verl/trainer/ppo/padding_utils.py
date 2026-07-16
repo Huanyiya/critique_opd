@@ -126,11 +126,23 @@ def construct_minimal_padding_template(
     if "teacher_topk_logprobs" in template_sample:
         topk = template_sample["teacher_topk_logprobs"].shape[-1]
         template_sample["teacher_topk_logprobs"] = torch.empty((0, topk), dtype=torch.float32)
+    if "teacher_topk_ids" in template_sample:
+        topk = template_sample["teacher_topk_ids"].shape[-1]
+        template_sample["teacher_topk_ids"] = torch.empty((0, topk), dtype=torch.int64)
+    if "teacher_own_topk_logprobs" in template_sample:
+        topk = template_sample["teacher_own_topk_logprobs"].shape[-1]
+        template_sample["teacher_own_topk_logprobs"] = torch.empty((0, topk), dtype=torch.float32)
     if "unprivileged_teacher_response_indices" in template_sample:
         template_sample["unprivileged_teacher_response_indices"] = torch.empty((0,), dtype=torch.int64)
     if "unprivileged_teacher_topk_logprobs" in template_sample:
         topk = template_sample["unprivileged_teacher_topk_logprobs"].shape[-1]
         template_sample["unprivileged_teacher_topk_logprobs"] = torch.empty((0, topk), dtype=torch.float32)
+    if "unprivileged_teacher_topk_ids" in template_sample:
+        topk = template_sample["unprivileged_teacher_topk_ids"].shape[-1]
+        template_sample["unprivileged_teacher_topk_ids"] = torch.empty((0, topk), dtype=torch.int64)
+    if "unprivileged_teacher_own_topk_logprobs" in template_sample:
+        topk = template_sample["unprivileged_teacher_own_topk_logprobs"].shape[-1]
+        template_sample["unprivileged_teacher_own_topk_logprobs"] = torch.empty((0, topk), dtype=torch.float32)
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
