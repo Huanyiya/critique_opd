@@ -11,7 +11,8 @@ DATA_DIR=${DATA_DIR:-${HOME}/data/alfworld_opd}
 export ALFWORLD_DATA=${ALFWORLD_DATA:-/mnt/cpfs/datasets/alfworld}
 export ALFWORLD_CONFIG_PATH=${ALFWORLD_CONFIG_PATH:-${ROOT_DIR}/examples/opd/alfworld/config_tw.yaml}
 
-OUTPUT_DIR=${OUTPUT_DIR:-${ROOT_DIR}/checkpoints/alfworld_opd}
+ALFWORLD_RUN_CHINA_TIMESTAMP=${ALFWORLD_RUN_CHINA_TIMESTAMP:-$(TZ=Asia/Shanghai date +%Y%m%d_%H%M)}
+OUTPUT_DIR=${OUTPUT_DIR:-${ROOT_DIR}/checkpoints/alfworld_opd_${ALFWORLD_RUN_CHINA_TIMESTAMP}}
 TRAIN_DATA_SIZE=${TRAIN_DATA_SIZE:-12}
 VAL_DATA_SIZE=${VAL_DATA_SIZE:-64}
 GROUP_SIZE=${GROUP_SIZE:-8}
@@ -21,8 +22,8 @@ MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 TEACHER_MAX_MODEL_LEN=${TEACHER_MAX_MODEL_LEN:-32768}
 
-STUDENT_GPUS_PER_NODE=${STUDENT_GPUS_PER_NODE:-6}
-TEACHER_GPUS_PER_NODE=${TEACHER_GPUS_PER_NODE:-2}
+STUDENT_GPUS_PER_NODE=${STUDENT_GPUS_PER_NODE:-4}
+TEACHER_GPUS_PER_NODE=${TEACHER_GPUS_PER_NODE:-4}
 NNODES=${NNODES:-1}
 STUDENT_TP=${STUDENT_TP:-1}
 TEACHER_TP=${TEACHER_TP:-1}
@@ -33,9 +34,10 @@ TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.7}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 PROJECT_NAME=${PROJECT_NAME:-alfworld_opd}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen35_text_alfworld_opd}
-SAVE_FREQ=${SAVE_FREQ:-10}
-TEST_FREQ=${TEST_FREQ:-10}
+SAVE_FREQ=${SAVE_FREQ:-20}
+TEST_FREQ=${TEST_FREQ:-20}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-false}
+
 
 export ALFWORLD_MAX_STEPS=${ALFWORLD_MAX_STEPS:-30}
 export ALFWORLD_HISTORY_LENGTH=${ALFWORLD_HISTORY_LENGTH:-5}
@@ -43,8 +45,18 @@ export ALFWORLD_MAX_ACTION_TOKENS=${ALFWORLD_MAX_ACTION_TOKENS:-${MAX_RESPONSE_L
 export ALFWORLD_ENV_WORKER_NUM_CPUS=${ALFWORLD_ENV_WORKER_NUM_CPUS:-0.1}
 export ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS=${ALFWORLD_TEACHER_CRITIQUE_MAX_TOKENS:-512}
 export ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE=${ALFWORLD_TEACHER_CRITIQUE_MIN_CONFIDENCE:-0.1}
+export ALFWORLD_STUDENT_ROLLOUT_LOG_PATH=${ALFWORLD_STUDENT_ROLLOUT_LOG_PATH:-"${OUTPUT_DIR}/alfworld_student_rollouts.txt"}
+export ALFWORLD_TEACHER_CRITIQUE_LOG_PATH=${ALFWORLD_TEACHER_CRITIQUE_LOG_PATH:-"${OUTPUT_DIR}/teacher_critique.txt"}
 export ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH=${ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH:-"${OUTPUT_DIR}/teacher_critique_rejects.txt"}
-export ALFWORLD_EVAL_SPLIT=${ALFWORLD_EVAL_SPLIT:-eval_out_of_distribution}
+export ALFWORLD_WORKER_TIMELINE_LOG_PATH=${ALFWORLD_WORKER_TIMELINE_LOG_PATH:-"${OUTPUT_DIR}/alfworld_worker_timeline.log"}
+export ALFWORLD_EVAL_SPLIT=${ALFWORLD_EVAL_SPLIT:-eval_in_distribution}
+
+mkdir -p "${OUTPUT_DIR}"
+touch \
+    "${ALFWORLD_STUDENT_ROLLOUT_LOG_PATH}" \
+    "${ALFWORLD_TEACHER_CRITIQUE_LOG_PATH}" \
+    "${ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH}" \
+    "${ALFWORLD_WORKER_TIMELINE_LOG_PATH}"
 
 
 PREPARE_DATA_ARGS=(
@@ -81,6 +93,7 @@ python3 -m verl.trainer.main_ppo_sync \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.n="${GROUP_SIZE}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${STUDENT_TP}" \
@@ -119,4 +132,8 @@ python3 -m verl.trainer.main_ppo_sync \
     trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
     trainer.critic_warmup=0 \
     +ray_kwargs.ray_init.runtime_env.env_vars.TRANSFER_QUEUE_ENABLE=1 \
+    +ray_kwargs.ray_init.runtime_env.env_vars.ALFWORLD_STUDENT_ROLLOUT_LOG_PATH="${ALFWORLD_STUDENT_ROLLOUT_LOG_PATH}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.ALFWORLD_TEACHER_CRITIQUE_LOG_PATH="${ALFWORLD_TEACHER_CRITIQUE_LOG_PATH}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH="${ALFWORLD_TEACHER_CRITIQUE_REJECT_LOG_PATH}" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.ALFWORLD_WORKER_TIMELINE_LOG_PATH="${ALFWORLD_WORKER_TIMELINE_LOG_PATH}" \
     "$@"

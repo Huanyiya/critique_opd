@@ -183,14 +183,9 @@ def format_alfworld_trajectory(trajectory_steps: list[dict[str, Any]]) -> str:
             f"{step['prompt_observation']}\n\n"
             f"Admissible actions before Action {step_number}:\n"
             f"{format_admissible_actions(admissible_actions_before)}\n\n"
-            f"Student output for Action {step_number}:\n"
-            f"{step['model_output']}\n\n"
-            f"Parsed student action {step_number}:\n"
+            f"Student action {step_number}:\n"
             f"{step['action']}\n\n"
-            f"Environment observation after Action {step_number}:\n"
-            f"{step['observation']}\n\n"
             f"Action output format valid: {step['format_valid']}\n"
-            f"Task solved after Action {step_number}: {step['won']}"
         )
     return "\n\n".join(formatted_steps)
 

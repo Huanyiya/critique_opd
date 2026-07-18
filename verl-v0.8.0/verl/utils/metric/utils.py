@@ -136,17 +136,44 @@ class Metric:
                 return np.max(values)
 
     @classmethod
-    def aggregate_dp(cls, metric_lists: list["Metric"]) -> float:
+    def aggregate_dp(cls, metric_lists: list["Metric"], *, allow_uneven: bool = False) -> float:
+        """Aggregate metrics collected from data-parallel ranks.
+
+        Dynamic token batching may produce a different number of micro-batches
+        on each DP rank.  When ``allow_uneven`` is enabled, SUM and MEAN are
+        reduced hierarchically (within each rank, then mean across ranks),
+        while MIN/MAX are reduced over all values.  The default remains strict
+        so an unexpected mismatch in static-batch training is still detected.
+        """
         if not metric_lists:
             raise ValueError("Cannot aggregate an empty list of metrics.")
+        aggregation = metric_lists[0].aggregation
+        if any(metric.aggregation != aggregation for metric in metric_lists[1:]):
+            raise ValueError(
+                "All Metric instances must have the same aggregation type for dp aggregation: "
+                f"{[metric.aggregation.value for metric in metric_lists]}"
+            )
         value_lists = [ml.values for ml in metric_lists]
-        if not all(len(ls) == len(value_lists[0]) for ls in value_lists):
+        value_counts = [len(values) for values in value_lists]
+        if any(count == 0 for count in value_counts):
+            raise ValueError(f"Cannot aggregate an empty Metric across dp ranks: {value_counts}")
+        equal_lengths = all(count == value_counts[0] for count in value_counts)
+        if not equal_lengths and not allow_uneven:
             raise ValueError(
                 f"All Metric instances must have the same number of values "
-                f"for dp aggregation: {[len(ls) for ls in value_lists]}"
+                f"for dp aggregation: {value_counts}"
             )
+        if not equal_lengths:
+            match aggregation:
+                case AggregationType.SUM | AggregationType.MEAN:
+                    per_rank_values = [cls._aggregate(values, aggregation) for values in value_lists]
+                    return float(np.mean(per_rank_values))
+                case AggregationType.MIN | AggregationType.MAX:
+                    return cls._aggregate(
+                        values=[value for values in value_lists for value in values], aggregation=aggregation
+                    )
+
         value_arrays = np.array(value_lists)  # [num_dp, num_grad_accumulation]
-        aggregation = metric_lists[0].aggregation
         match aggregation:
             case AggregationType.SUM | AggregationType.MEAN:
                 return cls._aggregate(

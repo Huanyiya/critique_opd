@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional
+import time
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 import torch
@@ -215,6 +216,28 @@ class AsyncTeacherLLMServerManager:
             )
         return routing_key
 
+    def _coordinator_client(self) -> LLMServerClient:
+        """Return any teacher client; all clients share one phase coordinator."""
+        return next(iter(self.teacher_client.values()))
+
+    async def arrive_and_wait_teacher_critique_batch(self, *, global_step: int, trajectory_key: str) -> dict[str, int]:
+        return await self._coordinator_client().arrive_and_wait_teacher_critique_batch(
+            global_step=global_step,
+            trajectory_key=trajectory_key,
+        )
+
+    async def abort_teacher_critique_batch(self, *, global_step: int, reason: str) -> None:
+        await self._coordinator_client().abort_teacher_critique_batch(global_step=global_step, reason=reason)
+
+    @staticmethod
+    async def _generate_teacher_scoring(client: LLMServerClient, **generate_kwargs):
+        """Run one teacher scoring request under the global scoring limit."""
+        await client.acquire_scoring_slot()
+        try:
+            return await client.generate(**generate_kwargs)
+        finally:
+            await client.release_scoring_slot()
+
     def empty_teacher_outputs(self, *, sequence_length: int, pad_token_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Build shape-compatible teacher tensors for a trajectory excluded from OPD."""
         if sequence_length <= 0:
@@ -240,7 +263,7 @@ class AsyncTeacherLLMServerManager:
 
     def empty_teacher_student_topk_outputs(
         self, *, topk: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build zero-row sparse teacher tensors for student-top-k reverse KL."""
         if topk <= 0:
             raise ValueError(f"topk must be positive, got {topk}.")
@@ -250,6 +273,7 @@ class AsyncTeacherLLMServerManager:
             torch.empty((0, topk), dtype=torch.float32),
             torch.empty((0, topk), dtype=torch.int64),
             torch.empty((0, topk), dtype=torch.float32),
+            torch.empty((0,), dtype=torch.float32),
         )
 
     async def generate_teacher_critique_single(
@@ -258,6 +282,7 @@ class AsyncTeacherLLMServerManager:
         prompt_ids: list[int],
         max_tokens: int,
         routing_key: Optional[str] = None,
+        on_slot_acquired: Optional[Callable[[float], None]] = None,
     ) -> list[int]:
         """Generate privileged critique ``c`` with the configured native teacher server."""
         if not prompt_ids:
@@ -266,16 +291,23 @@ class AsyncTeacherLLMServerManager:
             raise ValueError(f"max_tokens must be positive, got {max_tokens}.")
         teacher_key = self._resolve_teacher_key(routing_key)
         client = self.teacher_client[teacher_key]
-        output = await client.generate(
-            request_id=uuid4().hex,
-            prompt_ids=prompt_ids,
-            sampling_params={
-                "max_tokens": max_tokens,
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": -1,
-            },
-        )
+        wait_started = time.perf_counter()
+        await client.acquire_critique_slot()
+        try:
+            if on_slot_acquired is not None:
+                on_slot_acquired(time.perf_counter() - wait_started)
+            output = await client.generate(
+                request_id=uuid4().hex,
+                prompt_ids=prompt_ids,
+                sampling_params={
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                },
+            )
+        finally:
+            await client.release_critique_slot()
         return list(output.token_ids)
 
     async def compute_teacher_logprobs_single(
@@ -290,7 +322,8 @@ class AsyncTeacherLLMServerManager:
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
         client = self.teacher_client[teacher_key]
-        teacher_output = await client.generate(
+        teacher_output = await self._generate_teacher_scoring(
+            client,
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
             sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
@@ -340,7 +373,8 @@ class AsyncTeacherLLMServerManager:
                 "Excluded OPD trajectories should use empty_teacher_full_vocab_outputs instead."
             )
 
-        teacher_output = await client.generate(
+        teacher_output = await self._generate_teacher_scoring(
+            client,
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
             sampling_params={
@@ -386,7 +420,7 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute teacher logprobs only for rollout-time student top-k token ids."""
         if not self.uses_student_topk_support:
             raise RuntimeError(
@@ -420,13 +454,17 @@ class AsyncTeacherLLMServerManager:
             raise NotImplementedError("Teacher selected prompt logprobs require teacher temperature 1.0.")
         client = self.teacher_client[teacher_key]
         teacher_predictor_rows = teacher_prompt_length - 1 + response_indices
-        teacher_output = await client.generate(
+        actual_token_ids = torch.tensor(
+            [sequence_ids[teacher_prompt_length + index] for index in response_indices.tolist()],
+            dtype=torch.int64,
+        )
+        teacher_output = await self._generate_teacher_scoring(
+            client,
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
             sampling_params={
                 "max_tokens": 1,
                 "temperature": teacher_model_config.inference.temperature,
-                "prompt_logprobs": -1,
                 "prompt_logprob_token_ids": {
                     "positions": teacher_predictor_rows.tolist(),
                     "token_ids": student_topk_ids.tolist(),
@@ -438,7 +476,7 @@ class AsyncTeacherLLMServerManager:
             mm_processor_kwargs=mm_processor_kwargs,
         )
         returned_ids = torch.tensor(teacher_output.extra_fields["prompt_selected_ids"], dtype=torch.int64)
-        teacher_topk_logprobs = torch.tensor(
+        selected_logprobs = torch.tensor(
             teacher_output.extra_fields["prompt_selected_logprobs"], dtype=torch.float32
         )
         teacher_topk_ids = torch.tensor(
@@ -447,11 +485,25 @@ class AsyncTeacherLLMServerManager:
         teacher_own_topk_logprobs = torch.tensor(
             teacher_output.extra_fields["prompt_teacher_topk_logprobs"], dtype=torch.float32
         )
+        returned_actual_ids = torch.tensor(
+            teacher_output.extra_fields["prompt_selected_actual_ids"], dtype=torch.int64
+        )
+        teacher_student_token_logprobs = torch.tensor(
+            teacher_output.extra_fields["prompt_selected_actual_logprobs"], dtype=torch.float32
+        )
         if returned_ids.shape != student_topk_ids.shape or not torch.equal(returned_ids, student_topk_ids):
             raise ValueError(
                 "Teacher selected prompt logprobs were not returned for the requested student top-k ids: "
                 f"returned={returned_ids.shape}, requested={student_topk_ids.shape}."
             )
+        if returned_actual_ids.shape != actual_token_ids.shape or not torch.equal(returned_actual_ids, actual_token_ids):
+            raise ValueError(
+                "Teacher actual-token prompt logprobs are not aligned with the original student response: "
+                f"returned={returned_actual_ids.tolist()}, expected={actual_token_ids.tolist()}."
+            )
+        teacher_topk_logprobs = selected_logprobs
+        teacher_topk_ids = teacher_topk_ids[:, : student_topk_ids.shape[-1]]
+        teacher_own_topk_logprobs = teacher_own_topk_logprobs[:, : student_topk_ids.shape[-1]]
         if teacher_topk_logprobs.shape != student_topk_ids.shape:
             raise ValueError(
                 "Teacher selected prompt logprobs must match student_topk_ids shape, got "
@@ -467,4 +519,11 @@ class AsyncTeacherLLMServerManager:
                 "Teacher top-k logprobs must match student_topk_ids shape, got "
                 f"{teacher_own_topk_logprobs.shape} vs {student_topk_ids.shape}."
             )
-        return response_indices, student_topk_ids, teacher_topk_logprobs, teacher_topk_ids, teacher_own_topk_logprobs
+        return (
+            response_indices,
+            student_topk_ids,
+            teacher_topk_logprobs,
+            teacher_topk_ids,
+            teacher_own_topk_logprobs,
+            teacher_student_token_logprobs,
+        )

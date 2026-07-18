@@ -40,6 +40,11 @@ VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
 
+# SamplingParams.extra_args key used by the OPD teacher scorer.  Keeping the
+# requested token ids on the request lets the vLLM GPU worker gather them before
+# prompt logprobs are copied to CPU.
+OPD_PROMPT_TOPK_EXTRA_ARGS_KEY = "verl_opd_prompt_topk"
+
 
 def set_death_signal():
     """Kill the current process when the parent process exits."""
@@ -104,6 +109,197 @@ def monkey_patch_compute_logits(model, vocab_size: int):
     model.compute_logits = MethodType(compute_logits, model)
 
 
+def monkey_patch_opd_prompt_topk_logprobs() -> None:
+    """Gather OPD teacher logprobs on GPU instead of exporting the vocabulary.
+
+    vLLM normally implements ``prompt_logprobs=-1`` by copying a
+    ``[prompt_tokens, vocab_size]`` result to CPU and constructing Python
+    ``Logprob`` objects.  OPD only needs the teacher's own top-k, the
+    rollout-time student top-k ids, and the actually generated student token.
+    This patch recognizes requests carrying :data:`OPD_PROMPT_TOPK_EXTRA_ARGS_KEY`
+    and performs full-vocabulary logsumexp/top-k/gather on the GPU.  Only
+    O(num_selected_tokens * k) values cross the GPU/CPU and worker boundaries.
+
+    The non-OPD vLLM prompt-logprob path is left unchanged.
+    """
+    try:
+        from vllm.v1.outputs import LogprobsTensors
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except ImportError:
+        # This optimization targets the vLLM V1 worker used by the native
+        # teacher server.  Do not alter V0 behavior for unrelated rollouts.
+        logger.warning("vLLM V1 GPUModelRunner is unavailable; OPD GPU top-k scoring patch was not installed")
+        return
+
+    method_name = "_get_prompt_logprobs_dict"
+    original = getattr(GPUModelRunner, method_name, None)
+    if original is None:
+        logger.warning("vLLM GPUModelRunner has no %s; OPD GPU top-k scoring patch was not installed", method_name)
+        return
+    if getattr(original, "_verl_opd_gpu_topk", False):
+        return
+
+    def _get_prompt_logprobs_dict(self, hidden_states, num_scheduled_tokens):
+        num_prompt_logprobs_dict = self.num_prompt_logprobs
+        if not num_prompt_logprobs_dict:
+            return {}
+
+        opd_request_ids = []
+        regular_request_ids = []
+        for req_id in num_prompt_logprobs_dict:
+            request = self.requests[req_id]
+            sampling_params = request.sampling_params
+            extra_args = None if sampling_params is None else sampling_params.extra_args
+            if extra_args and OPD_PROMPT_TOPK_EXTRA_ARGS_KEY in extra_args:
+                opd_request_ids.append(req_id)
+            else:
+                regular_request_ids.append(req_id)
+
+        if not opd_request_ids:
+            return original(self, hidden_states, num_scheduled_tokens)
+        if regular_request_ids:
+            raise RuntimeError(
+                "OPD compact prompt-logprob requests cannot share one vLLM prefill batch with regular "
+                f"prompt-logprob requests; regular request ids: {regular_request_ids}."
+            )
+
+        in_progress_dict = self.input_batch.in_progress_prompt_logprobs_cpu
+        prompt_logprobs_dict = {}
+        completed_prefill_reqs = []
+        logit_chunk_size = max(1, int(os.getenv("VERL_OPD_TOPK_LOGIT_CHUNK_SIZE", "64")))
+
+        for req_id in opd_request_ids:
+            num_tokens = num_scheduled_tokens.get(req_id)
+            if num_tokens is None:
+                continue
+
+            request = self.requests[req_id]
+            if request.prompt_token_ids is None:
+                raise ValueError("OPD compact prompt logprobs require prompt token ids, not prompt embeddings.")
+            metadata = request.sampling_params.extra_args[OPD_PROMPT_TOPK_EXTRA_ARGS_KEY]
+            positions = [int(position) for position in metadata["positions"]]
+            student_token_ids = [[int(token_id) for token_id in row] for row in metadata["token_ids"]]
+            if len(positions) != len(student_token_ids):
+                raise ValueError(
+                    "OPD compact prompt-logprob positions and token-id rows must have equal length, got "
+                    f"{len(positions)} and {len(student_token_ids)}."
+                )
+            if not positions:
+                raise ValueError("OPD compact prompt-logprob request has no selected positions.")
+            if positions != sorted(set(positions)):
+                raise ValueError("OPD compact prompt-logprob positions must be sorted and unique.")
+            topk = len(student_token_ids[0])
+            if topk <= 0 or any(len(row) != topk for row in student_token_ids):
+                raise ValueError("OPD compact prompt-logprob token-id rows must have one common positive top-k size.")
+            if request.sampling_params.prompt_logprobs != 2 * topk:
+                raise ValueError(
+                    "OPD compact prompt-logprob requests must reserve teacher top-k plus student top-k slots: "
+                    f"prompt_logprobs={request.sampling_params.prompt_logprobs}, topk={topk}."
+                )
+
+            num_prompt_tokens = len(request.prompt_token_ids)
+            if positions[0] < 0 or positions[-1] >= num_prompt_tokens - 1:
+                raise ValueError(
+                    "OPD compact prompt-logprob position is outside the predictor range "
+                    f"[0, {num_prompt_tokens - 1}): {positions}."
+                )
+
+            compact_logprobs = in_progress_dict.get(req_id)
+            if compact_logprobs is None:
+                # Column 0 is the actual next prompt token (vLLM convention),
+                # followed by teacher top-k and rollout-time student top-k.
+                compact_logprobs = LogprobsTensors.empty_cpu(len(positions), 2 * topk + 1)
+                in_progress_dict[req_id] = compact_logprobs
+
+            start_idx = request.num_computed_tokens
+            start_tok = start_idx + 1
+            num_remaining_tokens = num_prompt_tokens - start_tok
+            if num_tokens <= num_remaining_tokens:
+                num_logits = num_tokens
+            else:
+                num_logits = num_remaining_tokens
+                completed_prefill_reqs.append(req_id)
+                prompt_logprobs_dict[req_id] = compact_logprobs
+
+            if num_logits <= 0:
+                continue
+
+            selected_compact_rows = [
+                compact_row
+                for compact_row, position in enumerate(positions)
+                if start_idx <= position < start_idx + num_logits
+            ]
+            if not selected_compact_rows:
+                continue
+
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            hidden_offset = self.query_start_loc.np[req_idx].item()
+            for chunk_start in range(0, len(selected_compact_rows), logit_chunk_size):
+                compact_rows = selected_compact_rows[chunk_start : chunk_start + logit_chunk_size]
+                absolute_positions = [positions[row] for row in compact_rows]
+                hidden_indices = torch.tensor(
+                    [hidden_offset + position - start_idx for position in absolute_positions],
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
+                selected_hidden_states = hidden_states.index_select(0, hidden_indices)
+                # float32 logsumexp matches full-vocabulary probabilities while
+                # avoiding bf16 underflow in small-probability tails.
+                logits = self.model.compute_logits(selected_hidden_states).float()
+                log_normalizer = torch.logsumexp(logits, dim=-1, keepdim=True)
+                teacher_logits, teacher_ids = torch.topk(logits, k=topk, dim=-1)
+
+                student_ids = torch.tensor(
+                    [student_token_ids[row] for row in compact_rows],
+                    dtype=torch.int64,
+                    device=logits.device,
+                )
+                if torch.any(student_ids < 0) or torch.any(student_ids >= logits.shape[-1]):
+                    raise ValueError("OPD student top-k contains a token id outside the teacher vocabulary.")
+                student_logits = torch.gather(logits, dim=-1, index=student_ids)
+                actual_ids = torch.tensor(
+                    [request.prompt_token_ids[position + 1] for position in absolute_positions],
+                    dtype=torch.int64,
+                    device=logits.device,
+                )
+                actual_logits = torch.gather(logits, dim=-1, index=actual_ids.unsqueeze(-1)).squeeze(-1)
+                actual_ranks = (logits > actual_logits.unsqueeze(-1)).sum(dim=-1, dtype=torch.int32) + 1
+
+                output_ids = torch.cat(
+                    [actual_ids.unsqueeze(-1), teacher_ids.to(torch.int64), student_ids], dim=-1
+                )
+                output_logprobs = torch.cat(
+                    [
+                        actual_logits.unsqueeze(-1) - log_normalizer,
+                        teacher_logits - log_normalizer,
+                        student_logits - log_normalizer,
+                    ],
+                    dim=-1,
+                )
+                cpu_rows = torch.tensor(compact_rows, dtype=torch.int64)
+                compact_logprobs.logprob_token_ids.index_copy_(
+                    0, cpu_rows, output_ids.to(device="cpu", dtype=torch.int32)
+                )
+                compact_logprobs.logprobs.index_copy_(
+                    0, cpu_rows, output_logprobs.to(device="cpu", dtype=torch.float32)
+                )
+                compact_logprobs.selected_token_ranks.index_copy_(
+                    0, cpu_rows, actual_ranks.to(device="cpu", dtype=torch.int32)
+                )
+
+        for req_id in completed_prefill_reqs:
+            del num_prompt_logprobs_dict[req_id]
+            del in_progress_dict[req_id]
+
+        if prompt_logprobs_dict:
+            self._sync_device()
+        return prompt_logprobs_dict
+
+    _get_prompt_logprobs_dict._verl_opd_gpu_topk = True
+    setattr(GPUModelRunner, method_name, _get_prompt_logprobs_dict)
+    logger.info("Installed compact GPU OPD teacher prompt-logprob scoring for vLLM V1")
+
+
 class vLLMColocateWorkerExtension:
     """
     The class for vLLM's worker to inherit from, in the colocate setting.
@@ -123,6 +319,9 @@ class vLLMColocateWorkerExtension:
 
         # 1. patch for Lora
         VLLMHijack.hijack()
+        # Keep full-vocabulary teacher logits on GPU for OPD scoring and only
+        # export teacher/student top-k values.
+        monkey_patch_opd_prompt_topk_logprobs()
         # 2. patch online fp8 quant
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1":
             apply_vllm_fp8_patches()
@@ -159,6 +358,10 @@ class vLLMColocateWorkerExtension:
         """Return the drafter's model object, or None if unavailable."""
         drafter = getattr(self.model_runner, "drafter", None)
         return drafter.model if drafter is not None and hasattr(drafter, "model") else None
+
+    def enable_opd_prompt_topk_logprobs(self):
+        """Install the compact OPD prompt-logprob path on this vLLM worker."""
+        monkey_patch_opd_prompt_topk_logprobs()
 
     def _get_draft_model_config(self):
         """Return the draft model config from speculative_config, or None."""
@@ -450,6 +653,76 @@ def extract_prompt_selected_logprobs(
             f"got {len(positions)} and {len(token_ids)}."
         )
 
+    if prompt_logprob_token_ids.get("gpu_compact", False):
+        # The GPU worker returned only the requested positions.  Each row
+        # contains the actual student token, teacher top-k, and student top-k;
+        # full-vocabulary logprobs never reached this process.
+        compact_logprobs = output.prompt_logprobs
+        actual_token_ids = [int(token_id) for token_id in prompt_logprob_token_ids.get("actual_token_ids", [])]
+        if not all(
+            hasattr(compact_logprobs, field)
+            for field in ("start_indices", "end_indices", "token_ids", "logprobs")
+        ):
+            raise TypeError("Compact GPU prompt logprobs require vLLM flat_logprobs output.")
+        # FlatLogprobs row zero is the conventional None entry for the first
+        # prompt token.  The remaining rows correspond exactly to `positions`.
+        if len(compact_logprobs) != len(positions) + 1 or len(actual_token_ids) != len(positions):
+            raise ValueError(
+                "Compact GPU prompt logprobs must return exactly one row per requested position, got "
+                f"rows={len(compact_logprobs) - 1}, positions={len(positions)}, "
+                f"actual_ids={len(actual_token_ids)}."
+            )
+
+        selected_ids: list[list[int]] = []
+        selected_logprobs: list[list[float]] = []
+        teacher_topk_ids: list[list[int]] = []
+        teacher_topk_logprobs: list[list[float]] = []
+        actual_logprobs: list[float] = []
+        for compact_row, (position, row_token_ids, actual_token_id) in enumerate(
+            zip(positions, token_ids, actual_token_ids, strict=True), start=1
+        ):
+            requested_ids = [int(token_id) for token_id in row_token_ids]
+            topk = len(requested_ids)
+            start = compact_logprobs.start_indices[compact_row]
+            end = compact_logprobs.end_indices[compact_row]
+            flat_ids = [int(token_id) for token_id in compact_logprobs.token_ids[start:end]]
+            flat_values = [float(logprob) for logprob in compact_logprobs.logprobs[start:end]]
+            if len(flat_ids) != 2 * topk + 1:
+                raise ValueError(
+                    "Compact GPU prompt-logprob row must contain actual, teacher top-k, and student top-k; "
+                    f"got width={len(flat_ids)}, expected={2 * topk + 1}, position={position}."
+                )
+            returned_actual_id = flat_ids[0]
+            row_teacher_topk_ids = flat_ids[1 : topk + 1]
+            row_teacher_topk_logprobs = flat_values[1 : topk + 1]
+            returned_selected_ids = flat_ids[topk + 1 :]
+            row_selected_logprobs = flat_values[topk + 1 :]
+            if returned_actual_id != actual_token_id:
+                raise ValueError(
+                    "Compact GPU actual token is not aligned with the prompt: "
+                    f"returned={returned_actual_id}, expected={actual_token_id}, position={position}."
+                )
+            if returned_selected_ids != requested_ids:
+                raise ValueError(
+                    "Compact GPU student top-k ids differ from the requested rollout-time ids: "
+                    f"returned={returned_selected_ids}, expected={requested_ids}, position={position}."
+                )
+
+            selected_ids.append(returned_selected_ids)
+            selected_logprobs.append(row_selected_logprobs)
+            teacher_topk_ids.append(row_teacher_topk_ids)
+            teacher_topk_logprobs.append(row_teacher_topk_logprobs)
+            actual_logprobs.append(flat_values[0])
+
+        result_dict["prompt_selected_positions"] = positions
+        result_dict["prompt_selected_ids"] = selected_ids
+        result_dict["prompt_selected_logprobs"] = selected_logprobs
+        result_dict["prompt_teacher_topk_ids"] = teacher_topk_ids
+        result_dict["prompt_teacher_topk_logprobs"] = teacher_topk_logprobs
+        result_dict["prompt_selected_actual_ids"] = actual_token_ids
+        result_dict["prompt_selected_actual_logprobs"] = actual_logprobs
+        return
+
     prompt_rows = output.prompt_logprobs[1:]
     selected_ids: list[list[int]] = []
     selected_logprobs: list[list[float]] = []
@@ -480,7 +753,7 @@ def extract_prompt_selected_logprobs(
             if token_logprob is None:
                 raise ValueError(
                     "vLLM did not return a requested prompt token id. "
-                    "Set the teacher engine max_logprobs to -1 for student-top-k OPD; "
+                    "Use the compact GPU prompt-logprob path for student-top-k OPD; "
                     f"missing token_id={token_id} at position={position}."
                 )
             row_logprobs.append(float(token_logprob.logprob))

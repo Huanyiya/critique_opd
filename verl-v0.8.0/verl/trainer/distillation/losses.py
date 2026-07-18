@@ -306,11 +306,15 @@ def compute_topk_loss(
                     teacher_topk_log_probs=data["teacher_topk_logprobs"],
                     teacher_topk_ids=data.get("teacher_topk_ids"),
                     teacher_own_topk_log_probs=data.get("teacher_own_topk_logprobs"),
+                    teacher_student_token_log_probs=data.get("teacher_student_token_logprobs"),
                     teacher_response_indices=data["teacher_response_indices"],
                     unprivileged_teacher_topk_log_probs=data.get("unprivileged_teacher_topk_logprobs"),
                     unprivileged_teacher_topk_ids=data.get("unprivileged_teacher_topk_ids"),
                     unprivileged_teacher_own_topk_log_probs=data.get(
                         "unprivileged_teacher_own_topk_logprobs"
+                    ),
+                    unprivileged_teacher_student_token_log_probs=data.get(
+                        "unprivileged_teacher_student_token_logprobs"
                     ),
                     unprivileged_teacher_response_indices=data.get("unprivileged_teacher_response_indices"),
                     data=data,

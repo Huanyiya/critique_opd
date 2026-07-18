@@ -29,7 +29,13 @@ import numpy as np
 import ray
 import yaml
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopBase,
+    AgentLoopMetrics,
+    AgentLoopOutput,
+    log_alfworld_opd_progress,
+    log_alfworld_worker_timeline,
+)
 from verl.experimental.agent_loop.teacher_prompt import ALFWorldCritiqueTeacherPromptBuilder, TeacherPromptBuilder
 from verl.utils.chat_template import apply_chat_template
 from verl.utils.rollout_trace import rollout_trace_op
@@ -108,13 +114,17 @@ class ALFWorldEnvironment(Protocol):
 
 
 def parse_alfworld_action(model_text: str, admissible_actions: list[str]) -> ParsedAction:
-    """Parse OPID-style ``<think>``/``<action>`` output."""
+    """Parse the action from a model turn.
+
+    ``<think>`` is allowed but not required; action validity only depends on a
+    valid ``<action>...</action>`` block, language guardrails, and membership in
+    the current admissible action set.
+    """
     original_text = model_text
     lowered = model_text.lower()
     match = ACTION_PATTERN.search(lowered)
-    has_thinking_block = "<think>" in original_text and "</think>" in original_text
     has_no_chinese = CHINESE_PATTERN.search(original_text) is None
-    format_valid = match is not None and has_thinking_block and has_no_chinese
+    format_valid = match is not None and has_no_chinese
     action = match.group(1).strip().lower() if match is not None else lowered[-30:]
     is_admissible = action in {candidate.strip().lower() for candidate in admissible_actions}
     is_valid = format_valid and is_admissible
@@ -944,6 +954,21 @@ class ALFWorldAgentLoop(AgentLoopBase):
             )
         if self.response_length < 2:
             raise ValueError(f"rollout.response_length must be at least 2, got {self.response_length}.")
+        self.progress_logging = os.getenv("ALFWORLD_PROGRESS_LOGGING", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self._progress_context: dict[str, Any] = {}
+
+    def _log_progress(self, stage: str, **fields: Any) -> None:
+        """Emit compact per-trajectory stage markers for distributed hang diagnosis."""
+        if not self.progress_logging:
+            return
+        context = dict(self._progress_context)
+        context.update(fields)
+        log_alfworld_opd_progress(stage, **context)
 
     def _resolve_split(self, extra_info: dict[str, Any]) -> str:
         requested = extra_info.get("alfworld_split") or extra_info.get("split")
@@ -974,20 +999,52 @@ class ALFWorldAgentLoop(AgentLoopBase):
         split = self._resolve_split(extra_info)
         session_id = int(kwargs.get("session_id", extra_info.get("session_id", 0)) or 0)
         validate = bool(kwargs.get("validate", extra_info.get("validate", False)))
-        if self.env_manager is not None:
-            worker = await self.loop.run_in_executor(
-                None,
-                lambda: ray.get(
-                    self.env_manager.get_worker.remote(
-                        validate=validate,
-                        sample_index=sample_index,
-                        session_id=session_id,
-                    )
-                ),
+        self._progress_context = {
+            "global_step": kwargs.get("global_steps"),
+            "mode": "val" if validate else "train",
+            "sample_index": sample_index,
+            "session_id": session_id,
+        }
+        trajectory_uid = uuid4().hex
+        task_uid: Optional[str] = None
+        timeline_context = {
+            "global_step": kwargs.get("global_steps"),
+            "mode": "val" if validate else "train",
+            "sample_index": sample_index,
+            "session_id": session_id,
+            "trajectory_uid": trajectory_uid,
+            "split": split,
+        }
+        log_alfworld_worker_timeline("student_rollout", "start", **timeline_context)
+        if not validate:
+            self._log_progress("student_rollout", status="start", split=split, trajectory_uid=trajectory_uid)
+        try:
+            if self.env_manager is not None:
+                worker = await self.loop.run_in_executor(
+                    None,
+                    lambda: ray.get(
+                        self.env_manager.get_worker.remote(
+                            validate=validate,
+                            sample_index=sample_index,
+                            session_id=session_id,
+                        )
+                    ),
+                )
+                environment = ALFWorldPersistentEnvironment(worker)
+            else:
+                environment = self.environment_factory(split=split, seed=self.seed + sample_index)
+        except BaseException as exc:
+            log_alfworld_worker_timeline(
+                "student_rollout",
+                "end",
+                **timeline_context,
+                status="error",
+                phase="acquire_environment",
+                elapsed_sec=round(time.perf_counter() - rollout_started, 3),
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
             )
-            environment = ALFWorldPersistentEnvironment(worker)
-        else:
-            environment = self.environment_factory(split=split, seed=self.seed + sample_index)
+            raise
 
         generate_seconds = 0.0
         num_preempted = 0
@@ -1019,7 +1076,6 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 or reset_info.get("gamefile")
                 or f"alfworld-{split}-{sample_index}"
             )
-            trajectory_uid = uuid4().hex
 
             initial_prompt = build_alfworld_prompt(
                 task_description=task_description,
@@ -1044,7 +1100,8 @@ class ALFWorldAgentLoop(AgentLoopBase):
                     prompt_ids=current_prompt_ids,
                     sampling_params=turn_sampling_params,
                 )
-                generate_seconds += time.perf_counter() - started
+                turn_generate_seconds = time.perf_counter() - started
+                generate_seconds += turn_generate_seconds
                 num_preempted += output.num_preempted if output.num_preempted is not None else 0
                 lightweight_extra_fields = {
                     key: value
@@ -1163,6 +1220,40 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 (index for index, step in enumerate(history) if not step["is_action_valid"]),
                 max(len(history) - 1, 0),
             )
+            if not validate:
+                self._log_progress(
+                    "student_rollout",
+                    status="done",
+                    trajectory_uid=trajectory_uid,
+                    steps=len(history),
+                    termination=termination_reason,
+                    elapsed_sec=f"{time.perf_counter() - rollout_started:.3f}",
+                )
+            log_alfworld_worker_timeline(
+                "student_rollout",
+                "end",
+                **timeline_context,
+                status="success",
+                task_uid=task_uid,
+                steps=len(history),
+                termination=termination_reason,
+                environment_reward=environment_reward,
+                elapsed_sec=round(time.perf_counter() - rollout_started, 3),
+            )
+        except BaseException as exc:
+            log_alfworld_worker_timeline(
+                "student_rollout",
+                "end",
+                **timeline_context,
+                status="error",
+                task_uid=task_uid,
+                steps=len(history),
+                phase="rollout",
+                elapsed_sec=round(time.perf_counter() - rollout_started, 3),
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+            raise
         finally:
             # Persistent ALFWorld workers are owned by ALFWorldEnvManager and
             # reused across steps. They are closed/killed by the manager, not by

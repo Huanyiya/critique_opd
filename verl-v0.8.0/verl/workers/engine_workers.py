@@ -309,7 +309,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
                         # flattn dp and micro batch
                         if isinstance(val, list):
                             output[key] = (
-                                Metric.aggregate_dp(val)
+                                # OPD expands each failed trajectory into a variable number of
+                                # per-step training samples.  DP ranks can therefore produce
+                                # different metric counts even when dynamic token batching is
+                                # disabled; aggregate those rank-local metrics hierarchically.
+                                Metric.aggregate_dp(val, allow_uneven=True)
                                 if isinstance(val[0], Metric)
                                 else list(chain.from_iterable(val))
                             )

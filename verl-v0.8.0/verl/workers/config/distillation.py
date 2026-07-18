@@ -217,7 +217,19 @@ class DistillationTeacherModelConfig(BaseConfig):
             match engine_name:
                 case "vllm":
                     vllm_engine_kwargs = dict(engine_kwargs.get("vllm", {}))
-                    vllm_engine_kwargs["max_logprobs"] = -1
+                    # The compact GPU scorer reserves k teacher-top-k and k
+                    # student-top-k entries.  Full-vocabulary logits remain on
+                    # the GPU and are never exposed through vLLM prompt output.
+                    assert topk is not None
+                    required_logprobs = 2 * topk
+                    configured_max = vllm_engine_kwargs.get("max_logprobs")
+                    if configured_max is None or configured_max == -1:
+                        vllm_engine_kwargs["max_logprobs"] = required_logprobs
+                    elif configured_max < required_logprobs:
+                        raise ValueError(
+                            f"VLLM max_logprobs ({configured_max}) must be >= 2 * distillation_loss topk "
+                            f"({required_logprobs}) for compact GPU OPD scoring."
+                        )
                     engine_kwargs["vllm"] = vllm_engine_kwargs
                     return
                 case "sglang":

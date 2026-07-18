@@ -22,7 +22,12 @@ from verl.single_controller.ray.base import RayResourcePool, split_resource_pool
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.ray_utils import auto_await
 from verl.workers.config import DistillationConfig, DistillationTeacherModelConfig, HFModelConfig
-from verl.workers.rollout.llm_server import LLMServerClient
+from verl.workers.rollout.llm_server import (
+    DEFAULT_TEACHER_CRITIQUE_MAX_CONCURRENCY,
+    GlobalCritiqueConcurrencyLimiter,
+    GlobalTeacherBatchPhaseCoordinator,
+    LLMServerClient,
+)
 from verl.workers.rollout.replica import get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
@@ -176,6 +181,22 @@ class MultiTeacherModelManager:
         self.load_balancer_handle: dict[str, object] = {}
 
         self._initialize_teacher_model_managers()
+        # One shared limiter covers every AgentLoopWorker and every teacher replica.
+        self.critique_limiter_handle = GlobalCritiqueConcurrencyLimiter.remote(
+            max_concurrency=DEFAULT_TEACHER_CRITIQUE_MAX_CONCURRENCY
+        )
+        # Scoring uses the same teacher servers as critique generation, but it
+        # starts only after the batch critique barrier.  Limit active scoring
+        # requests to one per replica of the selected teacher model.
+        self.scoring_limiter_handle = {}
+        for key, teacher_model in self.distillation_config.teacher_models.items():
+            num_replicas = int(teacher_model.num_replicas or 0)
+            if num_replicas <= 0:
+                raise ValueError(f"Teacher {key!r} scoring requires at least one inference replica.")
+            self.scoring_limiter_handle[key] = GlobalCritiqueConcurrencyLimiter.remote(
+                max_concurrency=num_replicas
+            )
+        self.teacher_batch_phase_handle = GlobalTeacherBatchPhaseCoordinator.remote()
 
     def _initialize_teacher_model_managers(self):
         teacher_models = self.distillation_config.teacher_models
@@ -200,5 +221,8 @@ class MultiTeacherModelManager:
             teacher_clients[key] = LLMServerClient(
                 config=self.config,
                 load_balancer_handle=manager.load_balancer_handle,
+                critique_limiter_handle=self.critique_limiter_handle,
+                scoring_limiter_handle=self.scoring_limiter_handle[key],
+                teacher_batch_phase_handle=self.teacher_batch_phase_handle,
             )
         return teacher_clients

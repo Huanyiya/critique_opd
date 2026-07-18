@@ -44,6 +44,7 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
 from verl.workers.rollout.vllm_rollout.utils import (
+    OPD_PROMPT_TOPK_EXTRA_ARGS_KEY,
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
     VLLM_LORA_PATH,
@@ -404,6 +405,7 @@ class vLLMHttpServer:
         await engine_client.collective_rpc(
             method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
         )
+        await engine_client.collective_rpc(method="enable_opd_prompt_topk_logprobs")
 
         build_app_sig = inspect.signature(build_app)
         supported_tasks: tuple[Any, ...] = ()
@@ -504,7 +506,41 @@ class vLLMHttpServer:
         )
         prompt_logprob_token_ids = sampling_params.pop("prompt_logprob_token_ids", None)
         if prompt_logprob_token_ids is not None:
-            sampling_params["prompt_logprobs"] = -1
+            positions = [int(position) for position in prompt_logprob_token_ids.get("positions", [])]
+            token_ids = [[int(token_id) for token_id in row] for row in prompt_logprob_token_ids.get("token_ids", [])]
+            if not positions or len(positions) != len(token_ids):
+                raise ValueError(
+                    "GPU OPD prompt-logprob scoring requires equal non-empty positions and token-id rows."
+                )
+            topk = len(token_ids[0])
+            if topk <= 0 or any(len(row) != topk for row in token_ids):
+                raise ValueError("GPU OPD prompt-logprob scoring requires a common positive top-k row width.")
+            if positions[0] < 0 or positions[-1] >= len(prompt_ids) - 1:
+                raise ValueError(
+                    f"GPU OPD prompt-logprob positions must be in [0, {len(prompt_ids) - 1}), got {positions}."
+                )
+
+            # vLLM's GPU worker consumes this metadata before copying any
+            # prompt logprobs to CPU.  Reserve k slots for teacher top-k and k
+            # slots for the caller-provided student top-k; vLLM adds the actual
+            # next prompt token as its leading selected-token column.
+            extra_args = dict(sampling_params.get("extra_args") or {})
+            if OPD_PROMPT_TOPK_EXTRA_ARGS_KEY in extra_args:
+                raise ValueError(f"sampling_params.extra_args already contains {OPD_PROMPT_TOPK_EXTRA_ARGS_KEY!r}.")
+            extra_args[OPD_PROMPT_TOPK_EXTRA_ARGS_KEY] = {
+                "positions": positions,
+                "token_ids": token_ids,
+            }
+            sampling_params["extra_args"] = extra_args
+            sampling_params["prompt_logprobs"] = 2 * topk
+            sampling_params["flat_logprobs"] = True
+            sampling_params["detokenize"] = False
+            prompt_logprob_token_ids = {
+                "positions": positions,
+                "token_ids": token_ids,
+                "actual_token_ids": [prompt_ids[position + 1] for position in positions],
+                "gpu_compact": True,
+            }
 
         requested_logprobs = sampling_params.pop("logprobs", False)
         if requested_logprobs is True:

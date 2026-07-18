@@ -28,7 +28,8 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 import logging
 import os
 import random
@@ -81,6 +82,69 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+CHINA_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
+DEFAULT_ALFWORLD_WORKER_TIMELINE_LOG_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "checkpoints",
+        "alfworld_opd",
+        "alfworld_worker_timeline.log",
+    )
+)
+
+
+def log_alfworld_opd_progress(stage: str, **fields: Any) -> None:
+    """Log one compact OPD stage marker with an explicit China timestamp."""
+    china_time = datetime.now(CHINA_TIMEZONE).isoformat(timespec="milliseconds")
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.warning(
+        "[ALFWORLD_OPD_PROGRESS] china_time=%s stage=%s %s",
+        china_time,
+        stage,
+        details,
+    )
+
+
+def log_alfworld_worker_timeline(stage: str, event: str, **fields: Any) -> None:
+    """Append one concurrency-safe China-time event shared by all ALFWorld workers."""
+    log_path = os.path.expanduser(
+        os.path.expandvars(
+            os.getenv("ALFWORLD_WORKER_TIMELINE_LOG_PATH", DEFAULT_ALFWORLD_WORKER_TIMELINE_LOG_PATH)
+        )
+    )
+    record = {
+        "china_time": datetime.now(CHINA_TIMEZONE).isoformat(timespec="milliseconds"),
+        "stage": stage,
+        "event": event,
+        "worker_pid": os.getpid(),
+        **fields,
+    }
+    line = json.dumps(record, ensure_ascii=False, default=str, separators=(",", ":")) + "\n"
+    try:
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            locked = False
+            if fcntl is not None:
+                try:
+                    fcntl.flock(log_file.fileno(), fcntl.LOCK_EX)
+                    locked = True
+                except OSError:
+                    # O_APPEND still keeps each compact record in one write on
+                    # filesystems that do not implement advisory locks.
+                    pass
+            try:
+                log_file.write(line)
+                log_file.flush()
+            finally:
+                if locked:
+                    fcntl.flock(log_file.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        logger.warning("Failed to write ALFWorld worker timeline to %s: %s", log_path, exc)
 
 
 class AgentLoopMetrics(BaseModel):
@@ -201,6 +265,7 @@ class AgentLoopOutput(BaseModel):
             output["extra_fields"].pop("teacher_topk_ids", None),
             output["extra_fields"].pop("teacher_own_topk_logprobs", None),
         )
+        teacher_student_token_logprobs = output["extra_fields"].pop("teacher_student_token_logprobs", None)
         unprivileged_teacher_topk_logprobs = output["extra_fields"].pop(
             "unprivileged_teacher_topk_logprobs", None
         )
@@ -209,6 +274,9 @@ class AgentLoopOutput(BaseModel):
         )
         unprivileged_teacher_own_topk_logprobs = output["extra_fields"].pop(
             "unprivileged_teacher_own_topk_logprobs", None
+        )
+        unprivileged_teacher_student_token_logprobs = output["extra_fields"].pop(
+            "unprivileged_teacher_student_token_logprobs", None
         )
         teacher_response_indices, teacher_full_logprobs = (
             output["extra_fields"].pop("teacher_response_indices", None),
@@ -234,12 +302,16 @@ class AgentLoopOutput(BaseModel):
             output["teacher_topk_ids"] = teacher_topk_ids
         if teacher_own_topk_logprobs is not None:
             output["teacher_own_topk_logprobs"] = teacher_own_topk_logprobs
+        if teacher_student_token_logprobs is not None:
+            output["teacher_student_token_logprobs"] = teacher_student_token_logprobs
         if unprivileged_teacher_topk_logprobs is not None:
             output["unprivileged_teacher_topk_logprobs"] = unprivileged_teacher_topk_logprobs
         if unprivileged_teacher_topk_ids is not None:
             output["unprivileged_teacher_topk_ids"] = unprivileged_teacher_topk_ids
         if unprivileged_teacher_own_topk_logprobs is not None:
             output["unprivileged_teacher_own_topk_logprobs"] = unprivileged_teacher_own_topk_logprobs
+        if unprivileged_teacher_student_token_logprobs is not None:
+            output["unprivileged_teacher_student_token_logprobs"] = unprivileged_teacher_student_token_logprobs
         if teacher_response_indices is not None:
             output["teacher_response_indices"] = teacher_response_indices
         if teacher_full_logprobs is not None:
@@ -286,12 +358,16 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Teacher-selected top-k token ids for overlap diagnostics."""
     teacher_own_topk_logprobs: Optional[torch.Tensor] = None
     """Teacher log probabilities gathered at teacher-selected top-k token ids."""
+    teacher_student_token_logprobs: Optional[torch.Tensor] = None
+    """Teacher log probabilities for the actual student-generated token at selected response positions."""
     unprivileged_teacher_topk_logprobs: Optional[torch.Tensor] = None
     """Unprivileged teacher log probabilities gathered at student-selected top-k ids."""
     unprivileged_teacher_topk_ids: Optional[torch.Tensor] = None
     """Unprivileged teacher-selected top-k token ids for overlap diagnostics."""
     unprivileged_teacher_own_topk_logprobs: Optional[torch.Tensor] = None
     """Unprivileged teacher log probabilities gathered at its own top-k token ids."""
+    unprivileged_teacher_student_token_logprobs: Optional[torch.Tensor] = None
+    """Unprivileged teacher log probabilities for the actual student-generated token."""
     teacher_response_indices: Optional[torch.Tensor] = None
     """Response-local positions with full-vocabulary teacher distributions."""
     teacher_full_logprobs: Optional[torch.Tensor] = None
@@ -873,6 +949,7 @@ class AgentLoopWorker:
             output.extra_fields.pop("teacher_topk_ids", None),
             output.extra_fields.pop("teacher_own_topk_logprobs", None),
         )
+        teacher_student_token_logprobs = output.extra_fields.pop("teacher_student_token_logprobs", None)
         unprivileged_teacher_topk_logprobs = output.extra_fields.pop(
             "unprivileged_teacher_topk_logprobs", None
         )
@@ -881,6 +958,9 @@ class AgentLoopWorker:
         )
         unprivileged_teacher_own_topk_logprobs = output.extra_fields.pop(
             "unprivileged_teacher_own_topk_logprobs", None
+        )
+        unprivileged_teacher_student_token_logprobs = output.extra_fields.pop(
+            "unprivileged_teacher_student_token_logprobs", None
         )
         teacher_response_indices, teacher_full_logprobs = (
             output.extra_fields.pop("teacher_response_indices", None),
@@ -935,9 +1015,11 @@ class AgentLoopWorker:
             teacher_topk_logprobs=teacher_topk_logprobs,
             teacher_topk_ids=teacher_topk_ids,
             teacher_own_topk_logprobs=teacher_own_topk_logprobs,
+            teacher_student_token_logprobs=teacher_student_token_logprobs,
             unprivileged_teacher_topk_logprobs=unprivileged_teacher_topk_logprobs,
             unprivileged_teacher_topk_ids=unprivileged_teacher_topk_ids,
             unprivileged_teacher_own_topk_logprobs=unprivileged_teacher_own_topk_logprobs,
+            unprivileged_teacher_student_token_logprobs=unprivileged_teacher_student_token_logprobs,
             teacher_response_indices=teacher_response_indices,
             teacher_full_logprobs=teacher_full_logprobs,
             unprivileged_teacher_response_indices=unprivileged_teacher_response_indices,
@@ -1069,6 +1151,7 @@ class AgentLoopWorker:
             output.extra_fields.pop("teacher_topk_ids", None),
             output.extra_fields.pop("teacher_own_topk_logprobs", None),
         )
+        teacher_student_token_logprobs = output.extra_fields.pop("teacher_student_token_logprobs", None)
         unprivileged_teacher_topk_logprobs = output.extra_fields.pop(
             "unprivileged_teacher_topk_logprobs", None
         )
@@ -1077,6 +1160,9 @@ class AgentLoopWorker:
         )
         unprivileged_teacher_own_topk_logprobs = output.extra_fields.pop(
             "unprivileged_teacher_own_topk_logprobs", None
+        )
+        unprivileged_teacher_student_token_logprobs = output.extra_fields.pop(
+            "unprivileged_teacher_student_token_logprobs", None
         )
         teacher_response_indices, teacher_full_logprobs = (
             output.extra_fields.pop("teacher_response_indices", None),
@@ -1132,9 +1218,11 @@ class AgentLoopWorker:
             teacher_topk_logprobs=teacher_topk_logprobs,
             teacher_topk_ids=teacher_topk_ids,
             teacher_own_topk_logprobs=teacher_own_topk_logprobs,
+            teacher_student_token_logprobs=teacher_student_token_logprobs,
             unprivileged_teacher_topk_logprobs=unprivileged_teacher_topk_logprobs,
             unprivileged_teacher_topk_ids=unprivileged_teacher_topk_ids,
             unprivileged_teacher_own_topk_logprobs=unprivileged_teacher_own_topk_logprobs,
+            unprivileged_teacher_student_token_logprobs=unprivileged_teacher_student_token_logprobs,
             teacher_response_indices=teacher_response_indices,
             teacher_full_logprobs=teacher_full_logprobs,
             unprivileged_teacher_response_indices=unprivileged_teacher_response_indices,
@@ -1293,6 +1381,7 @@ class AgentLoopWorker:
                 teacher_topk_logprobs,
                 teacher_topk_ids,
                 teacher_own_topk_logprobs,
+                teacher_student_token_logprobs,
             ) = (
                 self.teacher_server_manager.empty_teacher_student_topk_outputs(
                     topk=int(self.teacher_server_manager.distillation_loss_config.topk),
@@ -1303,10 +1392,14 @@ class AgentLoopWorker:
             output.extra_fields["teacher_topk_logprobs"] = teacher_topk_logprobs
             output.extra_fields["teacher_topk_ids"] = teacher_topk_ids
             output.extra_fields["teacher_own_topk_logprobs"] = teacher_own_topk_logprobs
+            output.extra_fields["teacher_student_token_logprobs"] = teacher_student_token_logprobs
             output.extra_fields["unprivileged_teacher_response_indices"] = teacher_response_indices.clone()
             output.extra_fields["unprivileged_teacher_topk_logprobs"] = teacher_topk_logprobs.clone()
             output.extra_fields["unprivileged_teacher_topk_ids"] = teacher_topk_ids.clone()
             output.extra_fields["unprivileged_teacher_own_topk_logprobs"] = teacher_own_topk_logprobs.clone()
+            output.extra_fields["unprivileged_teacher_student_token_logprobs"] = (
+                teacher_student_token_logprobs.clone()
+            )
             return
 
         if getattr(self.teacher_server_manager, "uses_full_vocab", False):
@@ -1345,27 +1438,49 @@ class AgentLoopWorker:
         if configured_path is None:
             trainer_config = self.config.get("trainer", {})
             default_local_dir = trainer_config.get("default_local_dir", ".") if trainer_config is not None else "."
-            configured_path = os.path.join(str(default_local_dir), "teacher_critique_rejects.txt")
+            configured_path = os.path.join(
+                str(default_local_dir),
+                "teacher_critique_rejects.txt",
+            )
 
         return os.path.expanduser(os.path.expandvars(configured_path))
 
-    def _training_rollout_log_path(self, output: AgentLoopOutput) -> str:
-        configured_path = output.extra_fields.get("training_rollout_log_path")
+    def _student_rollout_log_path(self, output: AgentLoopOutput) -> str:
+        configured_path = output.extra_fields.get("student_rollout_log_path")
         if configured_path is not None:
             configured_path = str(configured_path)
             if configured_path.lower() in {"", "none", "null"}:
                 configured_path = None
 
         if configured_path is None:
-            configured_path = os.getenv("ALFWORLD_TRAIN_ROLLOUT_LOG_PATH")
+            configured_path = os.getenv("ALFWORLD_STUDENT_ROLLOUT_LOG_PATH")
+            if configured_path is None:
+                # Backward-compatible override for older launch scripts.
+                configured_path = os.getenv("ALFWORLD_TRAIN_ROLLOUT_LOG_PATH")
             if configured_path is not None and configured_path.lower() in {"", "none", "null"}:
                 configured_path = None
 
         if configured_path is None:
             trainer_config = self.config.get("trainer", {})
             default_local_dir = trainer_config.get("default_local_dir", ".") if trainer_config is not None else "."
-            configured_path = os.path.join(str(default_local_dir), "alfworld_train_rollouts.txt")
+            configured_path = os.path.join(
+                str(default_local_dir),
+                "alfworld_student_rollouts.txt",
+            )
 
+        return os.path.expanduser(os.path.expandvars(str(configured_path)))
+
+    def _teacher_critique_log_path(self) -> str:
+        configured_path = os.getenv("ALFWORLD_TEACHER_CRITIQUE_LOG_PATH")
+        if configured_path is not None and configured_path.lower() in {"", "none", "null"}:
+            configured_path = None
+        if configured_path is None:
+            trainer_config = self.config.get("trainer", {})
+            default_local_dir = trainer_config.get("default_local_dir", ".") if trainer_config is not None else "."
+            configured_path = os.path.join(
+                str(default_local_dir),
+                "teacher_critique.txt",
+            )
         return os.path.expanduser(os.path.expandvars(str(configured_path)))
 
     @staticmethod
@@ -1383,7 +1498,7 @@ class AgentLoopWorker:
                 if fcntl is not None:
                     fcntl.flock(log_file.fileno(), fcntl.LOCK_UN)
 
-    def _format_training_rollout_record(self, output: AgentLoopOutput) -> str:
+    def _format_student_rollout_record(self, output: AgentLoopOutput) -> str:
         trajectory_steps = output.extra_fields.get("trajectory_steps", [])
         try:
             from verl.experimental.agent_loop.teacher_prompt import format_alfworld_trajectory
@@ -1392,46 +1507,59 @@ class AgentLoopWorker:
         except Exception:
             trajectory_text = repr(trajectory_steps)
 
-        parse_errors = output.extra_fields.get("teacher_critique_parse_errors", [])
-        if isinstance(parse_errors, (tuple, list)):
-            parse_errors_text = ", ".join(str(item) for item in parse_errors) if parse_errors else "(none)"
-        else:
-            parse_errors_text = str(parse_errors)
-
         return (
             "\n"
             + "=" * 100
             + "\n"
             + f"timestamp_utc: {datetime.now(timezone.utc).isoformat()}\n"
+            + f"timestamp_china: {datetime.now(CHINA_TIMEZONE).isoformat()}\n"
             + f"task_uid: {output.extra_fields.get('task_uid')}\n"
             + f"trajectory_uid: {output.extra_fields.get('trajectory_uid')}\n"
             + f"termination_reason: {output.extra_fields.get('termination_reason')}\n"
             + f"environment_reward: {output.extra_fields.get('environment_reward')}\n"
             + f"opd_eligible: {output.opd_eligible}\n"
-            + f"opd_selected: {output.extra_fields.get('opd_selected')}\n"
-            + f"opd_skip_reason: {output.extra_fields.get('opd_skip_reason')}\n"
-            + f"teacher_feedback_error_step: {output.extra_fields.get('teacher_feedback_error_step')}\n"
-            + f"teacher_feedback_confidence: {output.extra_fields.get('teacher_feedback_confidence')}\n"
-            + f"teacher_critique_parse_ok: {output.extra_fields.get('teacher_critique_parse_ok')}\n"
-            + f"teacher_critique_parse_errors: {parse_errors_text}\n"
-            + f"teacher_feedback_reason: {output.extra_fields.get('teacher_feedback_reason')}\n"
-            + f"teacher_feedback_better_decision: {output.extra_fields.get('teacher_feedback_better_decision')}\n"
-            + "\nTeacher critique prompt:\n"
-            + str(output.extra_fields.get("teacher_critique_prompt_text", "(not generated)"))
-            + "\n\nTeacher critique output:\n"
-            + str(output.extra_fields.get("teacher_critique", "(not generated / skipped)"))
-            + "\n\nStudent rollout trajectory:\n"
+            + "\nStudent rollout trajectory:\n"
             + trajectory_text
             + "\n"
         )
 
-    def _log_training_rollout(self, output: AgentLoopOutput) -> None:
-        log_path = self._training_rollout_log_path(output)
+    def _log_student_rollout(self, output: AgentLoopOutput) -> None:
+        log_path = self._student_rollout_log_path(output)
         try:
-            record = self._format_training_rollout_record(output)
+            record = self._format_student_rollout_record(output)
             self._append_text_record(log_path, record)
         except OSError as exc:
-            logger.warning("Failed to write training rollout log to %s: %s", log_path, exc)
+            logger.warning("Failed to write student rollout log to %s: %s", log_path, exc)
+
+    def _format_teacher_critique_record(self, output: AgentLoopOutput, *, critique: str, feedback: Any) -> str:
+        return (
+            "\n"
+            + "=" * 100
+            + "\n"
+            + f"timestamp_utc: {datetime.now(timezone.utc).isoformat()}\n"
+            + f"timestamp_china: {datetime.now(CHINA_TIMEZONE).isoformat()}\n"
+            + f"task_uid: {output.extra_fields.get('task_uid')}\n"
+            + f"trajectory_uid: {output.extra_fields.get('trajectory_uid')}\n"
+            + f"teacher_error_step: {getattr(feedback, 'error_step', 0) + 1}\n"
+            + f"teacher_confidence: {getattr(feedback, 'confidence', None)}\n"
+            + f"teacher_reason: {getattr(feedback, 'reason', None)}\n"
+            + f"teacher_better_decision: {getattr(feedback, 'better_decision', None)}\n"
+            + "\nTeacher critique prompt:\n"
+            + str(output.extra_fields.get("teacher_critique_prompt_text", "(not available)"))
+            + "\n\nTeacher critique output:\n"
+            + critique
+            + "\n"
+        )
+
+    def _log_teacher_critique(self, output: AgentLoopOutput, *, critique: str, feedback: Any) -> None:
+        log_path = self._teacher_critique_log_path()
+        try:
+            self._append_text_record(
+                log_path,
+                self._format_teacher_critique_record(output, critique=critique, feedback=feedback),
+            )
+        except OSError as exc:
+            logger.warning("Failed to write teacher critique log to %s: %s", log_path, exc)
 
     def _format_teacher_critique_reject_record(
         self,
@@ -1458,6 +1586,7 @@ class AgentLoopWorker:
             + "=" * 100
             + "\n"
             + f"timestamp_utc: {datetime.now(timezone.utc).isoformat()}\n"
+            + f"timestamp_china: {datetime.now(CHINA_TIMEZONE).isoformat()}\n"
             + f"reject_reason: {reject_reason}\n"
             + f"teacher_confidence: {getattr(feedback, 'confidence', None)}\n"
             + f"min_confidence: {output.teacher_critique_min_confidence}\n"
@@ -1493,8 +1622,7 @@ class AgentLoopWorker:
                 reject_reason=reject_reason,
                 feedback=feedback,
             )
-            with open(log_path, "a", encoding="utf-8") as log_file:
-                log_file.write(record)
+            self._append_text_record(log_path, record)
         except OSError as exc:
             logger.warning("Failed to write teacher critique reject log to %s: %s", log_path, exc)
 
@@ -1574,11 +1702,13 @@ class AgentLoopWorker:
                 "teacher_topk_logprobs",
                 "teacher_topk_ids",
                 "teacher_own_topk_logprobs",
+                "teacher_student_token_logprobs",
                 "unprivileged_teacher_ids",
                 "unprivileged_teacher_logprobs",
                 "unprivileged_teacher_topk_logprobs",
                 "unprivileged_teacher_topk_ids",
                 "unprivileged_teacher_own_topk_logprobs",
+                "unprivileged_teacher_student_token_logprobs",
                 "teacher_response_indices",
                 "teacher_full_logprobs",
                 "unprivileged_teacher_response_indices",
@@ -1641,10 +1771,35 @@ class AgentLoopWorker:
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> Optional[list[AgentLoopOutput]]:
         """Generate privileged critique when requested, then compute teacher logprobs."""
-        if not self.distillation_enabled or validate:
+        if not self.distillation_enabled:
+            return None
+        if validate:
             return None
 
-        should_log_training_rollout = output.teacher_critique_prompt_ids is not None
+        should_log_alfworld_rollout = output.teacher_critique_prompt_ids is not None
+        if should_log_alfworld_rollout:
+            # Persist the student trajectory before any teacher request so a
+            # later critique/scoring failure cannot hide the rollout result.
+            self._log_student_rollout(output)
+        use_teacher_batch_barrier = bool((sample_kwargs or {}).get("_teacher_batch_barrier")) and (
+            output.teacher_critique_prompt_ids is not None
+        )
+
+        async def _finish_critique_phase() -> None:
+            if not use_teacher_batch_barrier:
+                return
+            global_step_value = (sample_kwargs or {}).get("global_steps")
+            if hasattr(global_step_value, "item"):
+                global_step_value = global_step_value.item()
+            uid = (sample_kwargs or {}).get("uid", "unknown")
+            session_id = (sample_kwargs or {}).get("session_id", "unknown")
+            wait_started = time.perf_counter()
+            await self.teacher_server_manager.arrive_and_wait_teacher_critique_batch(
+                global_step=int(global_step_value),
+                trajectory_key=f"{uid}:{session_id}",
+            )
+            output.extra_fields["teacher_critique_batch_barrier_wait_sec"] = time.perf_counter() - wait_started
+
         routing_key = None
         if sample_kwargs is not None:
             routing_value = sample_kwargs.get(self.teacher_key)
@@ -1657,8 +1812,7 @@ class AgentLoopWorker:
                 # Successful trajectories remain available for reward metrics but contribute
                 # no OPD tokens and do not consume either teacher generation or scoring.
                 self._exclude_from_opd_training(output, prompt_ids, "not_opd_eligible")
-                if should_log_training_rollout:
-                    self._log_training_rollout(output)
+                await _finish_critique_phase()
                 return None
 
             if output.teacher_prompt_template is None or output.response_step_end_indices is None:
@@ -1676,12 +1830,97 @@ class AgentLoopWorker:
                 raise ValueError("Critique-conditioned OPD requires at least one student action step.")
 
             critique_started = time.perf_counter()
-            critique_ids = await self.teacher_server_manager.generate_teacher_critique_single(
-                prompt_ids=output.teacher_critique_prompt_ids,
+            critique_vllm_started: Optional[float] = None
+            timeline_context = {
+                "global_step": (sample_kwargs or {}).get("global_steps"),
+                "mode": "train",
+                "task_uid": output.extra_fields.get("task_uid"),
+                "trajectory_uid": output.extra_fields.get("trajectory_uid"),
+            }
+            log_alfworld_worker_timeline(
+                "teacher_critique",
+                "queued",
+                **timeline_context,
+                steps=len(output.response_step_end_indices),
+                prompt_tokens=len(output.teacher_critique_prompt_ids),
                 max_tokens=output.teacher_critique_max_tokens,
-                routing_key=routing_key,
             )
-            output.extra_fields["teacher_error_analysis_sec"] = time.perf_counter() - critique_started
+
+            def _on_critique_slot_acquired(wait_sec: float) -> None:
+                nonlocal critique_vllm_started
+                critique_vllm_started = time.perf_counter()
+                log_alfworld_worker_timeline(
+                    "teacher_critique",
+                    "start",
+                    **timeline_context,
+                    semaphore_wait_sec=round(wait_sec, 3),
+                    prompt_tokens=len(output.teacher_critique_prompt_ids),
+                    max_tokens=output.teacher_critique_max_tokens,
+                )
+
+            log_alfworld_opd_progress(
+                "teacher_generate_critique",
+                status="start",
+                global_step=(sample_kwargs or {}).get("global_steps"),
+                mode="train",
+                trajectory_uid=output.extra_fields.get("trajectory_uid"),
+                steps=len(output.response_step_end_indices),
+                prompt_tokens=len(output.teacher_critique_prompt_ids),
+                max_tokens=output.teacher_critique_max_tokens,
+            )
+            try:
+                critique_ids = await self.teacher_server_manager.generate_teacher_critique_single(
+                    prompt_ids=output.teacher_critique_prompt_ids,
+                    max_tokens=output.teacher_critique_max_tokens,
+                    routing_key=routing_key,
+                    on_slot_acquired=_on_critique_slot_acquired,
+                )
+            except BaseException as exc:
+                log_alfworld_worker_timeline(
+                    "teacher_critique",
+                    "end",
+                    **timeline_context,
+                    status="error",
+                    elapsed_sec=round(time.perf_counter() - critique_started, 3),
+                    vllm_elapsed_sec=(
+                        round(time.perf_counter() - critique_vllm_started, 3)
+                        if critique_vllm_started is not None
+                        else None
+                    ),
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                )
+                self._log_teacher_critique_reject(
+                    output,
+                    critique=f"(teacher critique generation failed: {type(exc).__name__}: {exc})",
+                    reject_reason="teacher_critique_generation_error",
+                    feedback=None,
+                )
+                raise
+            critique_seconds = time.perf_counter() - critique_started
+            output.extra_fields["teacher_error_analysis_sec"] = critique_seconds
+            log_alfworld_worker_timeline(
+                "teacher_critique",
+                "end",
+                **timeline_context,
+                status="success",
+                output_tokens=len(critique_ids),
+                elapsed_sec=round(critique_seconds, 3),
+                vllm_elapsed_sec=(
+                    round(time.perf_counter() - critique_vllm_started, 3)
+                    if critique_vllm_started is not None
+                    else None
+                ),
+            )
+            log_alfworld_opd_progress(
+                "teacher_generate_critique",
+                status="done",
+                global_step=(sample_kwargs or {}).get("global_steps"),
+                mode="train",
+                trajectory_uid=output.extra_fields.get("trajectory_uid"),
+                output_tokens=len(critique_ids),
+                elapsed_sec=f"{critique_seconds:.3f}",
+            )
             critique = self.tokenizer.decode(critique_ids, skip_special_tokens=True).strip()
 
             from verl.experimental.agent_loop.teacher_prompt import parse_critique_feedback
@@ -1711,8 +1950,7 @@ class AgentLoopWorker:
                     feedback=feedback,
                 )
                 self._exclude_from_opd_training(output, prompt_ids, "teacher_critique_parse_failed")
-                if should_log_training_rollout:
-                    self._log_training_rollout(output)
+                await _finish_critique_phase()
                 return None
             if feedback.confidence < output.teacher_critique_min_confidence:
                 self._log_teacher_critique_reject(
@@ -1722,26 +1960,74 @@ class AgentLoopWorker:
                     feedback=feedback,
                 )
                 self._exclude_from_opd_training(output, prompt_ids, "teacher_critique_low_confidence")
-                if should_log_training_rollout:
-                    self._log_training_rollout(output)
+                await _finish_critique_phase()
                 return None
 
             error_step = feedback.error_step
+            output.extra_fields["opd_selected"] = True
+            self._log_teacher_critique(output, critique=critique, feedback=feedback)
+            # No teacher probability request may enter vLLM until every
+            # original trajectory in this global batch has completed (or
+            # skipped) critique generation, parsing, and confidence filtering.
+            await _finish_critique_phase()
             if output.opd_step_prompt_ids is not None or output.opd_step_response_ids is not None:
                 original_response_length = (
                     sum(len(step_response_ids) for step_response_ids in output.opd_step_response_ids)
                     if output.opd_step_response_ids is not None
                     else len(output.response_ids)
                 )
-                expanded_outputs = await self._expand_current_prompt_opd_outputs(
-                    output,
-                    feedback=feedback,
-                    error_step=error_step,
-                    original_response_length=original_response_length,
-                    sample_kwargs=sample_kwargs,
+                teacher_prob_started = time.perf_counter()
+                log_alfworld_worker_timeline(
+                    "teacher_compute_prob",
+                    "start",
+                    **timeline_context,
+                    step_count=error_step + 1,
                 )
-                if should_log_training_rollout:
-                    self._log_training_rollout(output)
+                log_alfworld_opd_progress(
+                    "teacher_compute_prob",
+                    status="start",
+                    global_step=(sample_kwargs or {}).get("global_steps"),
+                    mode="train",
+                    trajectory_uid=output.extra_fields.get("trajectory_uid"),
+                    step_count=error_step + 1,
+                )
+                try:
+                    expanded_outputs = await self._expand_current_prompt_opd_outputs(
+                        output,
+                        feedback=feedback,
+                        error_step=error_step,
+                        original_response_length=original_response_length,
+                        sample_kwargs=sample_kwargs,
+                    )
+                except BaseException as exc:
+                    log_alfworld_worker_timeline(
+                        "teacher_compute_prob",
+                        "end",
+                        **timeline_context,
+                        status="error",
+                        step_count=error_step + 1,
+                        elapsed_sec=round(time.perf_counter() - teacher_prob_started, 3),
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:500],
+                    )
+                    raise
+                log_alfworld_worker_timeline(
+                    "teacher_compute_prob",
+                    "end",
+                    **timeline_context,
+                    status="success",
+                    step_count=len(expanded_outputs),
+                    elapsed_sec=round(time.perf_counter() - teacher_prob_started, 3),
+                )
+                log_alfworld_opd_progress(
+                    "teacher_compute_prob",
+                    status="done",
+                    global_step=(sample_kwargs or {}).get("global_steps"),
+                    mode="train",
+                    trajectory_uid=output.extra_fields.get("trajectory_uid"),
+                    step_count=len(expanded_outputs),
+                    elapsed_sec=f"{time.perf_counter() - teacher_prob_started:.3f}",
+                )
                 return expanded_outputs
 
             response_cutoff = output.response_step_end_indices[error_step]
@@ -1801,6 +2087,7 @@ class AgentLoopWorker:
                 teacher_topk_logprobs,
                 teacher_topk_ids,
                 teacher_own_topk_logprobs,
+                teacher_student_token_logprobs,
             ) = (
                 await self.teacher_server_manager.compute_teacher_student_topk_logprobs_single(
                     sequence_ids=teacher_prompt_ids + response_ids,
@@ -1812,12 +2099,14 @@ class AgentLoopWorker:
                     routing_key=routing_key,
                 )
             )
-            output.extra_fields["critique_teacher_scoring_sec"] = time.perf_counter() - critique_scoring_started
+            critique_scoring_seconds = time.perf_counter() - critique_scoring_started
+            output.extra_fields["critique_teacher_scoring_sec"] = critique_scoring_seconds
             output.extra_fields["teacher_response_indices"] = teacher_response_indices
             output.extra_fields["student_topk_ids"] = student_topk_ids
             output.extra_fields["teacher_topk_logprobs"] = teacher_topk_logprobs
             output.extra_fields["teacher_topk_ids"] = teacher_topk_ids
             output.extra_fields["teacher_own_topk_logprobs"] = teacher_own_topk_logprobs
+            output.extra_fields["teacher_student_token_logprobs"] = teacher_student_token_logprobs
 
             if output.extra_fields.get("opd_selected", False):
                 base_scoring_started = time.perf_counter()
@@ -1827,6 +2116,7 @@ class AgentLoopWorker:
                     unprivileged_teacher_topk_logprobs,
                     unprivileged_teacher_topk_ids,
                     unprivileged_teacher_own_topk_logprobs,
+                    unprivileged_teacher_student_token_logprobs,
                 ) = (
                     await self.teacher_server_manager.compute_teacher_student_topk_logprobs_single(
                         sequence_ids=prompt_ids + response_ids,
@@ -1838,16 +2128,18 @@ class AgentLoopWorker:
                         routing_key=routing_key,
                     )
                 )
-                output.extra_fields["base_teacher_scoring_sec"] = time.perf_counter() - base_scoring_started
+                base_scoring_seconds = time.perf_counter() - base_scoring_started
+                output.extra_fields["base_teacher_scoring_sec"] = base_scoring_seconds
                 output.extra_fields["unprivileged_teacher_response_indices"] = unprivileged_teacher_response_indices
                 output.extra_fields["unprivileged_teacher_topk_logprobs"] = unprivileged_teacher_topk_logprobs
                 output.extra_fields["unprivileged_teacher_topk_ids"] = unprivileged_teacher_topk_ids
                 output.extra_fields["unprivileged_teacher_own_topk_logprobs"] = (
                     unprivileged_teacher_own_topk_logprobs
                 )
+                output.extra_fields["unprivileged_teacher_student_token_logprobs"] = (
+                    unprivileged_teacher_student_token_logprobs
+                )
                 output.extra_fields["unprivileged_teacher_prompt_matches_student"] = True
-            if should_log_training_rollout:
-                self._log_training_rollout(output)
             return None
 
         if getattr(self.teacher_server_manager, "uses_full_vocab", False):
@@ -1863,8 +2155,6 @@ class AgentLoopWorker:
             )
             output.extra_fields["teacher_response_indices"] = teacher_response_indices
             output.extra_fields["teacher_full_logprobs"] = teacher_full_logprobs
-            if should_log_training_rollout:
-                self._log_training_rollout(output)
             return None
 
         teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
@@ -1906,8 +2196,6 @@ class AgentLoopWorker:
             output.extra_fields["unprivileged_teacher_ids"] = unprivileged_teacher_ids
             output.extra_fields["unprivileged_teacher_logprobs"] = unprivileged_teacher_logprobs
             output.extra_fields["unprivileged_teacher_prompt_matches_student"] = True
-        if should_log_training_rollout:
-            self._log_training_rollout(output)
         return None
 
     def _postprocess(
@@ -1957,6 +2245,10 @@ class AgentLoopWorker:
                 optional_outputs["teacher_own_topk_logprobs"] = torch.nested.as_nested_tensor(
                     [input.teacher_own_topk_logprobs for input in inputs], layout=torch.jagged
                 )
+            if inputs[0].teacher_student_token_logprobs is not None:
+                optional_outputs["teacher_student_token_logprobs"] = torch.nested.as_nested_tensor(
+                    [input.teacher_student_token_logprobs for input in inputs], layout=torch.jagged
+                )
         if inputs[0].unprivileged_teacher_topk_logprobs is not None:
             optional_outputs["unprivileged_teacher_topk_logprobs"] = torch.nested.as_nested_tensor(
                 [input.unprivileged_teacher_topk_logprobs for input in inputs], layout=torch.jagged
@@ -1968,6 +2260,10 @@ class AgentLoopWorker:
             if inputs[0].unprivileged_teacher_own_topk_logprobs is not None:
                 optional_outputs["unprivileged_teacher_own_topk_logprobs"] = torch.nested.as_nested_tensor(
                     [input.unprivileged_teacher_own_topk_logprobs for input in inputs], layout=torch.jagged
+                )
+            if inputs[0].unprivileged_teacher_student_token_logprobs is not None:
+                optional_outputs["unprivileged_teacher_student_token_logprobs"] = torch.nested.as_nested_tensor(
+                    [input.unprivileged_teacher_student_token_logprobs for input in inputs], layout=torch.jagged
                 )
         if inputs[0].teacher_full_logprobs is not None and inputs[0].teacher_response_indices is not None:
             optional_outputs["teacher_full_logprobs"] = torch.nested.as_nested_tensor(

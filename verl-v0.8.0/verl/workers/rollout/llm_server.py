@@ -38,6 +38,117 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+DEFAULT_TEACHER_CRITIQUE_MAX_CONCURRENCY = 4
+
+
+@ray.remote(max_concurrency=1000)
+class GlobalCritiqueConcurrencyLimiter:
+    """Global semaphore shared by all teacher clients and teacher replicas."""
+
+    def __init__(self, max_concurrency: int = DEFAULT_TEACHER_CRITIQUE_MAX_CONCURRENCY):
+        if max_concurrency <= 0:
+            raise ValueError(f"max_concurrency must be positive, got {max_concurrency}.")
+        self._max_concurrency = max_concurrency
+        self.critique_semaphore = asyncio.Semaphore(max_concurrency)
+        self._inflight = 0
+
+    async def acquire(self) -> None:
+        await self.critique_semaphore.acquire()
+        self._inflight += 1
+
+    async def release(self) -> None:
+        if self._inflight <= 0:
+            raise RuntimeError("Cannot release a teacher critique slot that was not acquired.")
+        self._inflight -= 1
+        self.critique_semaphore.release()
+
+    async def get_status(self) -> dict[str, int]:
+        return {
+            "max_concurrency": self._max_concurrency,
+            "inflight": self._inflight,
+        }
+
+
+@ray.remote(max_concurrency=10000)
+class GlobalTeacherBatchPhaseCoordinator:
+    """Coordinate critique-first OPD batches across all agent-loop workers.
+
+    Every original trajectory, including successful trajectories that skip
+    critique generation, arrives at the barrier exactly once.  Teacher
+    scoring may start only after the entire training batch has finished its
+    critique/parse/filter phase.
+    """
+
+    def __init__(self):
+        self._batches: dict[int, dict[str, Any]] = {}
+
+    def begin_batch(self, global_step: int, expected_trajectories: int) -> dict[str, int]:
+        global_step = int(global_step)
+        expected_trajectories = int(expected_trajectories)
+        if expected_trajectories <= 0:
+            raise ValueError(f"expected_trajectories must be positive, got {expected_trajectories}.")
+        existing = self._batches.get(global_step)
+        if existing is not None:
+            if existing["expected"] != expected_trajectories:
+                raise ValueError(
+                    f"Teacher batch {global_step} already expects {existing['expected']} trajectories, "
+                    f"cannot replace it with {expected_trajectories}."
+                )
+            return {"global_step": global_step, "expected": existing["expected"]}
+        self._batches[global_step] = {
+            "expected": expected_trajectories,
+            "arrived_keys": set(),
+            "event": asyncio.Event(),
+            "abort_reason": None,
+        }
+        return {"global_step": global_step, "expected": expected_trajectories}
+
+    async def arrive_and_wait(self, global_step: int, trajectory_key: str) -> dict[str, int]:
+        global_step = int(global_step)
+        state = self._batches.get(global_step)
+        if state is None:
+            raise RuntimeError(f"Teacher critique batch {global_step} was not initialized.")
+        state["arrived_keys"].add(str(trajectory_key))
+        arrived = len(state["arrived_keys"])
+        if arrived > state["expected"]:
+            reason = (
+                f"Teacher critique batch {global_step} received {arrived} unique trajectories, "
+                f"but expected only {state['expected']}."
+            )
+            state["abort_reason"] = reason
+            state["event"].set()
+        elif arrived == state["expected"]:
+            state["event"].set()
+
+        await state["event"].wait()
+        if state["abort_reason"] is not None:
+            raise RuntimeError(state["abort_reason"])
+        return {
+            "global_step": global_step,
+            "expected": state["expected"],
+            "arrived": len(state["arrived_keys"]),
+        }
+
+    def abort_batch(self, global_step: int, reason: str) -> None:
+        state = self._batches.get(int(global_step))
+        if state is None:
+            return
+        if state["abort_reason"] is None:
+            state["abort_reason"] = str(reason)
+        state["event"].set()
+
+    def get_status(self, global_step: int) -> dict[str, Any]:
+        state = self._batches.get(int(global_step))
+        if state is None:
+            return {"global_step": int(global_step), "initialized": False}
+        return {
+            "global_step": int(global_step),
+            "initialized": True,
+            "expected": state["expected"],
+            "arrived": len(state["arrived_keys"]),
+            "released": state["event"].is_set(),
+            "abort_reason": state["abort_reason"],
+        }
 
 
 @ray.remote
@@ -154,6 +265,9 @@ class LLMServerClient:
         self,
         config: DictConfig,
         load_balancer_handle: ray.actor.ActorHandle = None,
+        critique_limiter_handle: ray.actor.ActorHandle = None,
+        scoring_limiter_handle: ray.actor.ActorHandle = None,
+        teacher_batch_phase_handle: ray.actor.ActorHandle = None,
         **kwargs,
     ):
         """Initialize the LLMServerClient.
@@ -163,9 +277,48 @@ class LLMServerClient:
             load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor
                 that also holds the server-handle registry. Optional; subclasses that
                 manage server routing externally can pass None.
+            critique_limiter_handle (ray.actor.ActorHandle): optional global semaphore
+                used only for privileged teacher critique generation.
+            scoring_limiter_handle (ray.actor.ActorHandle): optional global semaphore
+                used only for teacher probability-scoring requests.
+            teacher_batch_phase_handle (ray.actor.ActorHandle): optional global
+                critique-first batch barrier shared by all agent-loop workers.
         """
         self.config = config
         self._load_balancer = load_balancer_handle
+        self._critique_limiter = critique_limiter_handle
+        self._scoring_limiter = scoring_limiter_handle
+        self._teacher_batch_phase = teacher_batch_phase_handle
+
+    async def acquire_critique_slot(self) -> None:
+        if self._critique_limiter is not None:
+            await self._critique_limiter.acquire.remote()
+
+    async def release_critique_slot(self) -> None:
+        if self._critique_limiter is not None:
+            await self._critique_limiter.release.remote()
+
+    async def acquire_scoring_slot(self) -> None:
+        if self._scoring_limiter is not None:
+            await self._scoring_limiter.acquire.remote()
+
+    async def release_scoring_slot(self) -> None:
+        if self._scoring_limiter is not None:
+            await self._scoring_limiter.release.remote()
+
+    def begin_teacher_critique_batch(self, global_step: int, expected_trajectories: int):
+        if self._teacher_batch_phase is None:
+            raise RuntimeError("Teacher batch phase coordinator is unavailable.")
+        return self._teacher_batch_phase.begin_batch.remote(global_step, expected_trajectories)
+
+    async def arrive_and_wait_teacher_critique_batch(self, global_step: int, trajectory_key: str) -> dict[str, int]:
+        if self._teacher_batch_phase is None:
+            raise RuntimeError("Teacher batch phase coordinator is unavailable.")
+        return await self._teacher_batch_phase.arrive_and_wait.remote(global_step, trajectory_key)
+
+    async def abort_teacher_critique_batch(self, global_step: int, reason: str) -> None:
+        if self._teacher_batch_phase is not None:
+            await self._teacher_batch_phase.abort_batch.remote(global_step, reason)
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.

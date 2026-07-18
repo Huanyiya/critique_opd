@@ -59,6 +59,7 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from verl.experimental.agent_loop.agent_loop import log_alfworld_opd_progress
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
 from verl.protocol import DataProto, DataProtoFuture
@@ -71,7 +72,6 @@ from verl.single_controller.ray import (
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -536,7 +536,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             config = self.config.actor_rollout_ref.rollout
             n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
             do_sample = prompt.pop("__do_sample__", True)
-
             run_sampling_params = dict(sampling_params)
             if not trajectory["validate"] and not do_sample:
                 apply_greedy_sampling_params(run_sampling_params)
@@ -553,6 +552,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
+            if (
+                not trajectory["validate"]
+                and self.distillation_enabled
+                and self.config.actor_rollout_ref.rollout.agent.default_agent_loop == "alfworld_opd"
+            ):
+                await self.teacher_server_manager.abort_teacher_critique_batch(
+                    global_step=int(prompt["global_steps"]),
+                    reason=f"Agent loop prompt {uid} failed before the critique-first batch completed: {e}",
+                )
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
     async def _agent_loop_postprocess(
@@ -568,12 +576,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
+        teacher_sample_kwargs = dict(kwargs)
+        teacher_sample_kwargs["_teacher_batch_barrier"] = not validate
         expanded_outputs = await self._compute_teacher_logprobs(
             final_output,
             prompt_ids=final_output.prompt_ids,
             response_ids=final_output.response_ids,
             validate=validate,
-            sample_kwargs=kwargs,
+            sample_kwargs=teacher_sample_kwargs,
         )
         if expanded_outputs is not None:
             outputs = expanded_outputs if isinstance(expanded_outputs, list) else [expanded_outputs]
@@ -665,6 +675,34 @@ class AgentLoopManagerTQ(AgentLoopManager):
         # mark prompts as pending in replay buffer
         global_steps = prompts["global_steps"]
         partition_id = "train" if "validate" not in prompts else "val"
+        if (
+            partition_id == "train"
+            and self.teacher_client
+            and is_distillation_enabled(self.config.distillation)
+            and self.config.actor_rollout_ref.rollout.agent.default_agent_loop == "alfworld_opd"
+        ):
+            global_step_value = global_steps.data if isinstance(global_steps, NonTensorData) else global_steps
+            global_step_value = int(_safe_scalar(global_step_value))
+            if "__rollout_n__" in prompts:
+                rollout_counts = prompts["__rollout_n__"]
+                if isinstance(rollout_counts, NonTensorStack):
+                    expected_trajectories = sum(
+                        int(value.data if isinstance(value, NonTensorData) else value) for value in rollout_counts
+                    )
+                elif isinstance(rollout_counts, torch.Tensor):
+                    expected_trajectories = int(rollout_counts.sum().item())
+                else:
+                    count = rollout_counts.data if isinstance(rollout_counts, NonTensorData) else rollout_counts
+                    expected_trajectories = len(prompts) * int(count)
+            else:
+                expected_trajectories = len(prompts) * int(self.config.actor_rollout_ref.rollout.n)
+            coordinator_client = next(iter(self.teacher_client.values()))
+            ray.get(
+                coordinator_client.begin_teacher_critique_batch(
+                    global_step=global_step_value,
+                    expected_trajectories=expected_trajectories,
+                )
+            )
         items = {uid: {"global_steps": global_steps, "status": "running"} for uid in prompts["uid"]}
         self.replay_buffer.add(partition_id, items)
 
@@ -1102,6 +1140,8 @@ class PPOTrainer:
             f.write(str(self.global_steps))
 
     def _validate(self) -> dict[str, float]:
+        test_started = time.perf_counter()
+        log_alfworld_opd_progress("test", status="start", global_step=self.global_steps, mode="val")
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -1247,7 +1287,15 @@ class PPOTrainer:
                 dump_path=val_data_dir,
             )
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metrics = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        log_alfworld_opd_progress(
+            "test",
+            status="done",
+            global_step=self.global_steps,
+            mode="val",
+            elapsed_sec=f"{time.perf_counter() - test_started:.3f}",
+        )
+        return metrics
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1597,14 +1645,9 @@ class PPOTrainer:
 
         data = DataProto(batch=data.to_padded_tensor())
 
-        # 3. calculate actor entroy metrics
-        actor_config = self.config.actor_rollout_ref.actor
-        entropy_agg = agg_loss(
-            loss_mat=data.batch["entropy"],
-            loss_mask=data.batch["response_mask"],
-            loss_agg_mode=actor_config.loss_agg_mode,
-            loss_scale_factor=actor_config.loss_scale_factor,
-        )
+        # 3. Record actor entropy on valid student action tokens.
+        response_mask = data.batch["response_mask"].to(dtype=data.batch["entropy"].dtype)
+        entropy_agg = (data.batch["entropy"] * response_mask).sum() / response_mask.sum().clamp(min=1.0)
         old_log_prob_metrics = {
             "actor/entropy": entropy_agg.detach().item(),
             # "perf/mfu/actor_infer": old_log_prob_mfu,
